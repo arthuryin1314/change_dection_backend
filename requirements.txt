@@ -1,0 +1,20 @@
+# 核心 Web 框架
+fastapi>=0.104.0
+uvicorn[standard]>=0.27.0  # FastAPI 的 ASGI 服务器
+
+# PostgreSQL 数据库相关
+psycopg2-binary>=2.9.9     # PostgreSQL 同步驱动（兼容大部分场景）
+asyncpg>=0.29.0            # PostgreSQL 异步驱动（高性能）
+sqlalchemy[asyncio]>=2.0.23 # 异步 ORM 框架
+
+# 密码加密
+passlib[bcrypt]>=1.7.4
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# 可选：数据验证增强（FastAPI 已内置，按需添加）
+pydantic>=2.5.2
+
+# 可选：Redis 缓存（如果用到）
+redis>=5.0.1
