@@ -34,5 +34,5 @@ class UserToken(Base):
     )
     expire_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
-        default=lambda: datetime.now() + timedelta(hours=1)  # Token expires in 1 hour
+        default=lambda: datetime.now() + timedelta(days=1)  # Token expires in 1 hour
     )

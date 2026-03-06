@@ -11,6 +11,11 @@ async def get_user_by_username(db:AsyncSession,username:str):
     result = await db.execute(query)
     return result.scalar_one_or_none()
 
+async def get_user_by_telNum(db:AsyncSession,telNum:str):
+    query = select(User).where(User.phone == telNum)
+    result = await db.execute(query)
+    return result.scalar_one_or_none()
+
 async def create_user(db:AsyncSession,user_data:UserRequest):
     hashed_password = get_password_hash(user_data.password)
     user = User(username=user_data.name, password=hashed_password, phone=user_data.telNum)
