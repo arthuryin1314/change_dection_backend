@@ -5,6 +5,7 @@ from starlette import status
 from schemas.users import UserRequest, UserLoginRequest
 from config.db_config import get_db
 from crud.users import get_user_by_username,create_user, createToken,get_user_by_telNum
+from utils.get_user_by_token import get_current_user
 from utils.response import success_response
 from utils.security import verify_password
 
@@ -39,4 +40,12 @@ async def login_user(form_data:UserLoginRequest, db: AsyncSession = Depends(get_
     token = await createToken(db, db_user.id)
     return success_response(message='登录成功', data={
         'token': token
+    })
+
+@router.get('/info')
+async def get_user_info(current_user = Depends(get_current_user)):
+    return success_response(message='获取用户信息成功', data={
+        'id': current_user.id,
+        'username': current_user.username,
+        'telNum': current_user.phone,
     })
