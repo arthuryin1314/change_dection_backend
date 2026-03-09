@@ -19,6 +19,7 @@ async def register_user(user_data: UserRequest, db: AsyncSession = Depends(get_d
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户已经存在")
     user = await create_user(db,user_data)
     token = await createToken(db,user.id)
+    await db.commit()
     return success_response(message='注册成功', data={
         'token':token,
          "userInfo": {
@@ -38,6 +39,7 @@ async def login_user(form_data:UserLoginRequest, db: AsyncSession = Depends(get_
     if not verify_password(form_data.password, db_user.password):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="密码错误")
     token = await createToken(db, db_user.id)
+    await db.commit()
     return success_response(message='登录成功', data={
         'token': token
     })

@@ -13,18 +13,21 @@ async def get_current_user(
         db: AsyncSession = Depends(get_db),
         authorization: str = Header(..., alias='Authorization',description='示例: Bearer token')
 ):
-    if not authorization or not authorization.startswith('Bearer '):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='未授权')
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token format")
+    token = authorization.split(' ')[1]
 
-    token = authorization.split(' ', 1)[1]
+    # Temporary auth debug to inspect header/token parsing during troubleshooting.
+    print("repr(authorization)=", repr(authorization))
+    print("repr(token)=", repr(token))
+    print("len(token)=", len(token))
+
     user_id = await get_user_by_token(db, token)
-    if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Token无效或已过期')
-
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token过期或无效")
     query = select(User).where(User.id == user_id)
     result = await db.execute(query)
-    db_user = result.scalar_one_or_none()
-    if not db_user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='用户不存在')
-
-    return db_user
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户未被发现")
+    return user
