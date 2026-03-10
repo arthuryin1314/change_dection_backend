@@ -12,7 +12,7 @@ from utils.security import verify_password
 router = APIRouter(prefix='/api/users', tags=['users'])
 
 
-@router.post('/register')
+@router.post('/register',summary='注册用户')
 async def register_user(user_data: UserRequest, db: AsyncSession = Depends(get_db)):
     existing_user = await get_user_by_username(db, user_data.name)
     if existing_user:
@@ -30,7 +30,7 @@ async def register_user(user_data: UserRequest, db: AsyncSession = Depends(get_d
     }
     )
 
-@router.post('/login')
+@router.post('/login',summary='用户登录')
 async def login_user(form_data:UserLoginRequest, db: AsyncSession = Depends(get_db)):
     #逻辑:查找用户存不存在,如果存在,验证密码是否正确,如果正确,生成token返回
     db_user = await get_user_by_telNum(db, form_data.telNum)
@@ -44,7 +44,7 @@ async def login_user(form_data:UserLoginRequest, db: AsyncSession = Depends(get_
         'token': token
     })
 
-@router.get('/info')
+@router.get('/info',summary='获取用户信息')
 async def get_user_info(current_user = Depends(get_current_user)):
     return success_response(message='获取用户信息成功', data={
         'id': current_user.id,
