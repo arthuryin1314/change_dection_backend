@@ -1,0 +1,473 @@
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List, Optional
+import shutil
+from pathlib import Path
+import json
+import os
+import time
+from uuid import uuid4
+
+from pydantic import BaseModel
+
+from config.db_config import get_db
+from crud import images as crud_images
+from schemas.images import ImageResponse
+from utils.response import success_response
+from utils.date_parser import parse_capture_date
+from utils.get_user_by_token import get_current_user
+
+router = APIRouter(prefix="/api/images", tags=["images"])
+
+# 配置上传目录
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+IMAGE_DIR = UPLOAD_DIR / "images"
+IMAGE_DIR.mkdir(exist_ok=True)
+
+SHAPEFILE_DIR = UPLOAD_DIR / "shapefiles"
+SHAPEFILE_DIR.mkdir(exist_ok=True)
+
+TMP_UPLOAD_DIR = UPLOAD_DIR / "tmp"
+TMP_UPLOAD_DIR.mkdir(exist_ok=True)
+
+SESSION_META_FILE = "session.json"
+CHUNKS_DIR_NAME = "chunks"
+COMPLETE_LOCK_FILE = ".complete.lock"
+UPLOAD_TTL_SECONDS = 24 * 60 * 60
+
+
+class UploadInitRequest(BaseModel):
+    file_hash: str
+    file_name: str
+    file_size: int
+    chunk_size: int
+    total_chunks: int
+
+
+def _session_dir(upload_id: str) -> Path:
+    return TMP_UPLOAD_DIR / upload_id
+
+
+def _meta_path(upload_id: str) -> Path:
+    return _session_dir(upload_id) / SESSION_META_FILE
+
+
+def _chunks_dir(upload_id: str) -> Path:
+    return _session_dir(upload_id) / CHUNKS_DIR_NAME
+
+
+def _save_meta(upload_id: str, meta: dict) -> None:
+    meta["updated_at"] = int(time.time())
+    meta_file = _meta_path(upload_id)
+    meta_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = meta_file.with_suffix(".tmp")
+    temp_file.write_text(json.dumps(meta), encoding="utf-8")
+    temp_file.replace(meta_file)
+
+
+def _load_meta(upload_id: str) -> dict:
+    meta_file = _meta_path(upload_id)
+    if not meta_file.exists():
+        raise HTTPException(status_code=404, detail="upload_id 不存在")
+    try:
+        return json.loads(meta_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取上传会话失败: {str(exc)}")
+
+
+def _list_uploaded_chunks(upload_id: str) -> List[int]:
+    chunks_dir = _chunks_dir(upload_id)
+    if not chunks_dir.exists():
+        return []
+
+    result: List[int] = []
+    for part_file in chunks_dir.glob("*.part"):
+        try:
+            result.append(int(part_file.stem))
+        except ValueError:
+            continue
+    return sorted(result)
+
+
+def _cleanup_expired_tmp_uploads() -> None:
+    now_ts = time.time()
+    for upload_dir in TMP_UPLOAD_DIR.iterdir():
+        if not upload_dir.is_dir():
+            continue
+
+        meta_file = upload_dir / SESSION_META_FILE
+        expire_base = meta_file if meta_file.exists() else upload_dir
+        age = now_ts - expire_base.stat().st_mtime
+
+        if age <= UPLOAD_TTL_SECONDS:
+            continue
+
+        # 已完成会话不清理，保留用于 complete 幂等返回
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                if meta.get("status") == "completed":
+                    continue
+            except Exception:
+                pass
+
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
+def _find_upload_id_by_hash(file_hash: str) -> Optional[str]:
+    latest_upload_id = None
+    latest_mtime = -1.0
+
+    for upload_dir in TMP_UPLOAD_DIR.iterdir():
+        if not upload_dir.is_dir():
+            continue
+
+        meta_file = upload_dir / SESSION_META_FILE
+        if not meta_file.exists():
+            continue
+
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if meta.get("file_hash") != file_hash:
+            continue
+
+        mtime = meta_file.stat().st_mtime
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_upload_id = upload_dir.name
+
+    return latest_upload_id
+
+
+async def _save_shp_and_create_records(
+    db: AsyncSession,
+    image_name: str,
+    resolution: float,
+    capture_date: str,
+    satellite: str,
+    image_type: str,
+    region_code: str,
+    tif_path: Path,
+    shp_files: List[UploadFile],
+):
+    parsed_capture_date = parse_capture_date(capture_date)
+
+    shp_dir = SHAPEFILE_DIR / f"{region_code}_{image_name}"
+    shp_dir.mkdir(exist_ok=True)
+
+    shp_path = None
+    dbf_path = None
+    prj_path = None
+
+    for shp_file in shp_files:
+        if not shp_file.filename:
+            continue
+
+        save_path = shp_dir / Path(shp_file.filename).name
+        with save_path.open("wb") as buffer:
+            shutil.copyfileobj(shp_file.file, buffer)
+
+        lower_name = shp_file.filename.lower()
+        if lower_name.endswith(".shp"):
+            shp_path = str(save_path)
+        elif lower_name.endswith(".dbf"):
+            dbf_path = str(save_path)
+        elif lower_name.endswith(".prj"):
+            prj_path = str(save_path)
+
+    db_image = await crud_images.create_image(
+        db=db,
+        image_name=image_name,
+        resolution=resolution,
+        capture_date=parsed_capture_date,
+        satellite=satellite,
+        image_type=image_type,
+        region_code=region_code,
+        img_path=str(tif_path),
+    )
+
+    await crud_images.create_boundary_files(
+        db=db,
+        image_id=db_image.id,
+        file_prefix=f"{region_code}_{image_name}",
+        shp_path=shp_path,
+        dbf_path=dbf_path,
+        prj_path=prj_path,
+    )
+
+    return db_image
+
+
+@router.post("/upload/init", summary="初始化分片上传")
+async def init_upload(payload: UploadInitRequest):
+    _cleanup_expired_tmp_uploads()
+
+    if payload.file_size <= 0 or payload.chunk_size <= 0 or payload.total_chunks <= 0:
+        raise HTTPException(status_code=422, detail="file_size/chunk_size/total_chunks 必须大于 0")
+
+    upload_id = uuid4().hex
+    upload_dir = _session_dir(upload_id)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    _chunks_dir(upload_id).mkdir(parents=True, exist_ok=True)
+
+    _save_meta(
+        upload_id,
+        {
+            "upload_id": upload_id,
+            "file_hash": payload.file_hash,
+            "file_name": payload.file_name,
+            "file_size": payload.file_size,
+            "chunk_size": payload.chunk_size,
+            "total_chunks": payload.total_chunks,
+            "status": "uploading",
+            "created_at": int(time.time()),
+        },
+    )
+
+    return success_response(message="初始化成功", data={"upload_id": upload_id})
+
+
+@router.get("/upload/status", summary="查询分片上传状态")
+async def get_upload_status(
+    upload_id: Optional[str] = Query(None),
+    file_hash: Optional[str] = Query(None),
+):
+    _cleanup_expired_tmp_uploads()
+
+    resolved_upload_id = upload_id
+    if not resolved_upload_id and file_hash:
+        resolved_upload_id = _find_upload_id_by_hash(file_hash)
+
+    if not resolved_upload_id:
+        raise HTTPException(status_code=404, detail="未找到上传会话")
+
+    meta = _load_meta(resolved_upload_id)
+    uploaded_chunks = _list_uploaded_chunks(resolved_upload_id)
+
+    return success_response(
+        message="获取状态成功",
+        data={
+            "upload_id": resolved_upload_id,
+            "file_hash": meta.get("file_hash"),
+            "status": meta.get("status", "uploading"),
+            "uploaded_chunks": uploaded_chunks,
+            "total_chunks": meta.get("total_chunks"),
+        },
+    )
+
+
+@router.post("/upload/chunk", summary="上传单个分片")
+async def upload_chunk(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    chunk: Optional[UploadFile] = File(None, alias="chunk"),
+    chunk_file: Optional[UploadFile] = File(None, alias="chunk_file"),
+):
+    _cleanup_expired_tmp_uploads()
+
+    meta = _load_meta(upload_id)
+    if meta.get("status") == "completed":
+        return success_response(message="上传已完成，分片上传跳过", data={"chunk_index": chunk_index})
+
+    if chunk_index < 0 or chunk_index >= int(meta["total_chunks"]):
+        raise HTTPException(status_code=422, detail="chunk_index 超出范围")
+
+    chunk_data = chunk or chunk_file
+    if not chunk_data:
+        raise HTTPException(status_code=422, detail="缺少 chunk 文件")
+
+    part_path = _chunks_dir(upload_id) / f"{chunk_index}.part"
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with part_path.open("wb") as buffer:
+        shutil.copyfileobj(chunk_data.file, buffer)
+
+    meta["status"] = "uploading"
+    _save_meta(upload_id, meta)
+
+    return success_response(message="分片上传成功", data={"upload_id": upload_id, "chunk_index": chunk_index})
+
+
+@router.post("/upload/complete", summary="完成分片上传并入库")
+async def complete_upload(
+    upload_id: str = Form(...),
+    image_name: str = Form(...),
+    resolution: float = Form(...),
+    capture_date: str = Form(...),
+    satellite: str = Form(...),
+    image_type: str = Form(..., alias="type"),
+    region_code: str = Form(...),
+    shp_files: List[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    _cleanup_expired_tmp_uploads()
+
+    meta = _load_meta(upload_id)
+
+    # complete 幂等：重复调用直接返回上次结果
+    if meta.get("status") == "completed" and meta.get("result"):
+        return success_response(message="上传已完成", data=meta["result"])
+
+    lock_path = _session_dir(upload_id) / COMPLETE_LOCK_FILE
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="该上传正在合并，请稍后重试")
+
+    tif_path: Optional[Path] = None
+    try:
+        total_chunks = int(meta["total_chunks"])
+        chunk_size = int(meta["chunk_size"])
+        file_size = int(meta["file_size"])
+
+        uploaded = _list_uploaded_chunks(upload_id)
+        required = list(range(total_chunks))
+        if uploaded != required:
+            missing = sorted(set(required) - set(uploaded))
+            raise HTTPException(status_code=422, detail=f"分片不完整，缺失: {missing[:20]}")
+
+        merged_size = 0
+        for idx in required:
+            part_path = _chunks_dir(upload_id) / f"{idx}.part"
+            part_size = part_path.stat().st_size
+
+            if idx < total_chunks - 1 and part_size != chunk_size:
+                raise HTTPException(status_code=422, detail=f"分片 {idx} 大小不正确")
+            if idx == total_chunks - 1 and not (0 < part_size <= chunk_size):
+                raise HTTPException(status_code=422, detail="最后一片大小不正确")
+
+            merged_size += part_size
+
+        if merged_size != file_size:
+            raise HTTPException(status_code=422, detail="分片总大小与文件大小不一致")
+
+        original_name = Path(str(meta.get("file_name", "merged.tif"))).name
+        if not original_name.lower().endswith((".tif", ".tiff")):
+            raise HTTPException(status_code=422, detail="最终文件必须是 .tif/.tiff")
+
+        tif_filename = f"{region_code}_{image_name}_{original_name}"
+        tif_path = IMAGE_DIR / tif_filename
+        with tif_path.open("wb") as merged_file:
+            for idx in required:
+                part_path = _chunks_dir(upload_id) / f"{idx}.part"
+                with part_path.open("rb") as part_file:
+                    shutil.copyfileobj(part_file, merged_file)
+
+        if tif_path.stat().st_size != file_size:
+            raise HTTPException(status_code=422, detail="合并后文件大小校验失败")
+
+        db_image = await _save_shp_and_create_records(
+            db=db,
+            image_name=image_name,
+            resolution=resolution,
+            capture_date=capture_date,
+            satellite=satellite,
+            image_type=image_type,
+            region_code=region_code,
+            tif_path=tif_path,
+            shp_files=shp_files,
+        )
+        await db.commit()
+
+        result = {
+            "id": db_image.id,
+            "image_name": db_image.image_name,
+            "img_path": db_image.img_path,
+            "upload_id": upload_id,
+        }
+        meta["status"] = "completed"
+        meta["result"] = result
+        _save_meta(upload_id, meta)
+
+        return success_response(message="影像上传成功", data=result)
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"上传失败: {str(exc)}")
+    finally:
+        if lock_path.exists():
+            lock_path.unlink(missing_ok=True)
+
+
+@router.post("/upload", summary="上传影像（整文件，兼容旧流程）")
+async def upload_image(
+    image_name: str = Form(..., description="影像名称"),
+    resolution: float = Form(..., description="影像分辨率"),
+    capture_date: str = Form(..., description="拍摄日期，支持 YYYY-MM-DD 或 JS Date 字符串"),
+    satellite: str = Form(..., description="卫星名称"),
+    image_type: str = Form(..., alias="type", description="影像类型"),
+    region_code: str = Form(..., description="区域代码"),
+    image_file: UploadFile = File(..., description="遥感影像文件（必填，.tif/.tiff）"),
+    shp_files: List[UploadFile] = File(..., description="Shapefile文件（必填，.shp, .dbf, .prj等）"),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        if not image_file.filename or not image_file.filename.lower().endswith((".tif", ".tiff")):
+            raise ValueError("image_file 必须是 .tif 或 .tiff 文件")
+
+        tif_filename = f"{region_code}_{image_name}_{Path(image_file.filename).name}"
+        tif_path = IMAGE_DIR / tif_filename
+        with tif_path.open("wb") as buffer:
+            shutil.copyfileobj(image_file.file, buffer)
+
+        db_image = await _save_shp_and_create_records(
+            db=db,
+            image_name=image_name,
+            resolution=resolution,
+            capture_date=capture_date,
+            satellite=satellite,
+            image_type=image_type,
+            region_code=region_code,
+            tif_path=tif_path,
+            shp_files=shp_files,
+        )
+
+        await db.commit()
+
+        return success_response(
+            message="影像上传成功",
+            data={"id": db_image.id, "image_name": db_image.image_name, "img_path": db_image.img_path},
+        )
+
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"上传失败: {str(exc)}")
+
+
+@router.get("/list", response_model=List[ImageResponse], summary="获取所有影像列表")
+async def get_images_list(db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
+    """
+    获取所有影像记录，按上传时间降序排列
+    需要Bearer token认证
+    """
+    try:
+        images = await crud_images.get_all_images(db)
+        return images
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取影像列表失败: {str(exc)}")
+
+
+@router.get("/{image_id}", response_model=ImageResponse, summary="根据ID获取影像")
+async def get_image(image_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    根据ID获取单个影像记录
+    """
+    image = await crud_images.get_image_by_id(db, image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="影像不存在")
+    return image

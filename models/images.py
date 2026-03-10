@@ -1,17 +1,15 @@
-from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Date, Text, DateTime, ForeignKey,Numeric
 from sqlalchemy.orm import relationship, DeclarativeBase
 from geoalchemy2 import Geometry
 from datetime import datetime
-
-class Base(DeclarativeBase):
-    pass
+from models.Base import Base
 
 class Image(Base):
     __tablename__ = "images"
 
     id            = Column(Integer, primary_key=True, index=True)
     image_name    = Column(String(255), nullable=False)
-    resolution    = Column(Float)
+    resolution    = Column(Numeric(10, 4))
     capture_date  = Column(Date)
     satellite     = Column(String(200))
     image_type    = Column(String(50))
@@ -22,6 +20,8 @@ class Image(Base):
 
     # 关联 boundary_files
     boundary_files = relationship("BoundaryFile", back_populates="image")
+    # before_tasks   = relationship("DetectionTask", foreign_keys="DetectionTask.before_image_id", back_populates="before_image")  # 待后续实现
+    # after_tasks    = relationship("DetectionTask", foreign_keys="DetectionTask.after_image_id",  back_populates="after_image")   # 待后续实现
 
 
 class BoundaryFile(Base):

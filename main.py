@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from router import users
 from utils.exception_handler import register_exception_handlers
-
+from router import images
 origins = ['http://localhost:5173']
 app = FastAPI()
 app.add_middleware(
@@ -13,6 +13,7 @@ app.add_middleware(
     allow_credentials=True,
 )
 app.include_router(users.router)
+app.include_router(images.router)
 register_exception_handlers(app)
 @app.get("/")
 async def root():

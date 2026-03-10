@@ -1,6 +1,7 @@
 # 核心 Web 框架
 fastapi>=0.104.0
 uvicorn[standard]>=0.27.0  # FastAPI 的 ASGI 服务器
+python-multipart>=0.0.6    # 文件上传支持
 
 # PostgreSQL 数据库相关
 psycopg2-binary>=2.9.9     # PostgreSQL 同步驱动（兼容大部分场景）
