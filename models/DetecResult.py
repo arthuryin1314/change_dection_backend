@@ -1,5 +1,5 @@
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey, Numeric
+from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey, Numeric, BigInteger
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
 from datetime import datetime
@@ -9,6 +9,7 @@ class AnalysisResult(Base):
     __tablename__ = "analysis_results"
 
     id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(BigInteger, ForeignKey("user_info.id", ondelete="CASCADE"), nullable=False)
     task_id     = Column(Integer, ForeignKey("detection_tasks.id"))
     region_code = Column(String(20))
     change_area = Column(Numeric(15, 4))

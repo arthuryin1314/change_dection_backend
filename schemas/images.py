@@ -25,6 +25,7 @@ class ImageResponse(BaseModel):
     image_type: Optional[str]
     region_code: Optional[str]
     img_path: Optional[str]
+    shp_path: Optional[str] = None
     upload_time: Optional[datetime]
 
 

@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
-from schemas.users import UserRequest, UserLoginRequest
+from schemas.users import UserRequest, UserLoginRequest, UserUpdateRequest, UserUpdatePassword
 from config.db_config import get_db
-from crud.users import get_user_by_username,create_user, createToken,get_user_by_telNum
+from crud.users import get_user_by_username,create_user, createToken,get_user_by_telNum, update_user_info as crud_update_user_info, \
+    check_old_password, clear_user_token, update_password as crud_update_password
 from utils.get_user_by_token import get_current_user
 from utils.response import success_response
 from utils.security import verify_password
@@ -51,3 +52,46 @@ async def get_user_info(current_user = Depends(get_current_user)):
         'username': current_user.username,
         'telNum': current_user.phone,
     })
+
+@router.put('/updateInfo',summary='更新用户信息')
+async def update_user_info(
+    user_info: UserUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    new_user = await crud_update_user_info(db, user_info, current_user.id)
+    if not new_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    await db.commit()
+    return success_response(
+        message='更新用户信息成功',
+        data={
+            'id': new_user.id,
+            'username': new_user.username,
+            'telNum': new_user.phone,
+        }
+    )
+
+@router.put('/updatePassword',summary='更新用户密码')
+async def update_password(
+        pass_form:UserUpdatePassword,
+        db: AsyncSession = Depends(get_db),
+        current_user = Depends(get_current_user)
+):
+    is_old_password_right=await check_old_password(db,pass_form.oldPassword,current_user.id)
+    if not is_old_password_right:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="旧密码错误")
+    updated=await crud_update_password(db,pass_form.password,current_user.id)
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    await clear_user_token(db,current_user.id)
+    await db.commit()
+    return success_response(message='更新密码成功,请重新登录')
+
+@router.put('/logout',summary='退出登录')
+async def logout(current_user = Depends(get_current_user),db:AsyncSession = Depends(get_db)):
+    is_logout = await clear_user_token(db,current_user.id)
+    if not is_logout:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    await db.commit()
+    return success_response(message='退出登录成功')

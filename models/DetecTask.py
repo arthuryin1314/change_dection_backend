@@ -1,5 +1,5 @@
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey, Numeric
+from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey, Numeric, BigInteger
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
 from datetime import datetime
@@ -9,6 +9,7 @@ class DetectionTask(Base):
     __tablename__ = "detection_tasks"
 
     id              = Column(Integer, primary_key=True, index=True)
+    user_id         = Column(BigInteger, ForeignKey("user_info.id", ondelete="CASCADE"), nullable=False)
     task_name       = Column(String(255))
     before_image_id = Column(Integer, ForeignKey("images.id"))
     after_image_id  = Column(Integer, ForeignKey("images.id"))

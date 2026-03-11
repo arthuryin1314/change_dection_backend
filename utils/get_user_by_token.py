@@ -17,11 +17,6 @@ async def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token format")
     token = authorization.split(' ')[1]
 
-    # Temporary auth debug to inspect header/token parsing during troubleshooting.
-    print("repr(authorization)=", repr(authorization))
-    print("repr(token)=", repr(token))
-    print("len(token)=", len(token))
-
     user_id = await get_user_by_token(db, token)
     if user_id is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token过期或无效")

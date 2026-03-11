@@ -3,11 +3,7 @@ from datetime import datetime
 from datetime import timedelta
 from sqlalchemy import DateTime, Integer, String, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-
-class Base(DeclarativeBase):
-    pass
-
+from models.Base import Base
 
 class User(Base):
     __tablename__ = "user_info"

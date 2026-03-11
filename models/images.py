@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, Text, DateTime, ForeignKey,Numeric
+from sqlalchemy import Column, Integer, String, Date, Text, DateTime, ForeignKey,Numeric, BigInteger
 from sqlalchemy.orm import relationship, DeclarativeBase
 from geoalchemy2 import Geometry
 from datetime import datetime
@@ -8,6 +8,7 @@ class Image(Base):
     __tablename__ = "images"
 
     id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(BigInteger, ForeignKey("user_info.id", ondelete="CASCADE"), nullable=False)
     image_name    = Column(String(255), nullable=False)
     resolution    = Column(Numeric(10, 4))
     capture_date  = Column(Date)

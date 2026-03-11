@@ -116,7 +116,7 @@ def _cleanup_expired_tmp_uploads() -> None:
         shutil.rmtree(upload_dir, ignore_errors=True)
 
 
-def _find_upload_id_by_hash(file_hash: str) -> Optional[str]:
+def _find_upload_id_by_hash(file_hash: str, user_id: int) -> Optional[str]:
     latest_upload_id = None
     latest_mtime = -1.0
 
@@ -133,7 +133,7 @@ def _find_upload_id_by_hash(file_hash: str) -> Optional[str]:
         except Exception:
             continue
 
-        if meta.get("file_hash") != file_hash:
+        if meta.get("file_hash") != file_hash or meta.get("user_id") != user_id:
             continue
 
         mtime = meta_file.stat().st_mtime
@@ -146,6 +146,7 @@ def _find_upload_id_by_hash(file_hash: str) -> Optional[str]:
 
 async def _save_shp_and_create_records(
     db: AsyncSession,
+    user_id: int,
     image_name: str,
     resolution: float,
     capture_date: str,
@@ -182,6 +183,7 @@ async def _save_shp_and_create_records(
 
     db_image = await crud_images.create_image(
         db=db,
+        user_id=user_id,
         image_name=image_name,
         resolution=resolution,
         capture_date=parsed_capture_date,
@@ -203,8 +205,16 @@ async def _save_shp_and_create_records(
     return db_image
 
 
+def _pick_shp_path(image) -> Optional[str]:
+    boundary_files = getattr(image, "boundary_files", None) or []
+    for bf in boundary_files:
+        if getattr(bf, "shp_path", None):
+            return bf.shp_path
+    return None
+
+
 @router.post("/upload/init", summary="初始化分片上传")
-async def init_upload(payload: UploadInitRequest):
+async def init_upload(payload: UploadInitRequest, current_user=Depends(get_current_user)):
     _cleanup_expired_tmp_uploads()
 
     if payload.file_size <= 0 or payload.chunk_size <= 0 or payload.total_chunks <= 0:
@@ -219,6 +229,7 @@ async def init_upload(payload: UploadInitRequest):
         upload_id,
         {
             "upload_id": upload_id,
+            "user_id": current_user.id,
             "file_hash": payload.file_hash,
             "file_name": payload.file_name,
             "file_size": payload.file_size,
@@ -236,17 +247,20 @@ async def init_upload(payload: UploadInitRequest):
 async def get_upload_status(
     upload_id: Optional[str] = Query(None),
     file_hash: Optional[str] = Query(None),
+    current_user=Depends(get_current_user),
 ):
     _cleanup_expired_tmp_uploads()
 
     resolved_upload_id = upload_id
     if not resolved_upload_id and file_hash:
-        resolved_upload_id = _find_upload_id_by_hash(file_hash)
+        resolved_upload_id = _find_upload_id_by_hash(file_hash, current_user.id)
 
     if not resolved_upload_id:
         raise HTTPException(status_code=404, detail="未找到上传会话")
 
     meta = _load_meta(resolved_upload_id)
+    if meta.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="未找到上传会话")
     uploaded_chunks = _list_uploaded_chunks(resolved_upload_id)
 
     return success_response(
@@ -267,10 +281,13 @@ async def upload_chunk(
     chunk_index: int = Form(...),
     chunk: Optional[UploadFile] = File(None, alias="chunk"),
     chunk_file: Optional[UploadFile] = File(None, alias="chunk_file"),
+    current_user=Depends(get_current_user),
 ):
     _cleanup_expired_tmp_uploads()
 
     meta = _load_meta(upload_id)
+    if meta.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="upload_id 不存在")
     if meta.get("status") == "completed":
         return success_response(message="上传已完成，分片上传跳过", data={"chunk_index": chunk_index})
 
@@ -304,10 +321,13 @@ async def complete_upload(
     region_code: str = Form(...),
     shp_files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
     _cleanup_expired_tmp_uploads()
 
     meta = _load_meta(upload_id)
+    if meta.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="upload_id 不存在")
 
     # complete 幂等：重复调用直接返回上次结果
     if meta.get("status") == "completed" and meta.get("result"):
@@ -364,6 +384,7 @@ async def complete_upload(
 
         db_image = await _save_shp_and_create_records(
             db=db,
+            user_id=current_user.id,
             image_name=image_name,
             resolution=resolution,
             capture_date=capture_date,
@@ -412,6 +433,7 @@ async def upload_image(
     image_file: UploadFile = File(..., description="遥感影像文件（必填，.tif/.tiff）"),
     shp_files: List[UploadFile] = File(..., description="Shapefile文件（必填，.shp, .dbf, .prj等）"),
     db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
     try:
         if not image_file.filename or not image_file.filename.lower().endswith((".tif", ".tiff")):
@@ -424,6 +446,7 @@ async def upload_image(
 
         db_image = await _save_shp_and_create_records(
             db=db,
+            user_id=current_user.id,
             image_name=image_name,
             resolution=resolution,
             capture_date=capture_date,
@@ -452,22 +475,47 @@ async def upload_image(
 @router.get("/list", response_model=List[ImageResponse], summary="获取所有影像列表")
 async def get_images_list(db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
     """
-    获取所有影像记录，按上传时间降序排列
+    获取当前用户的影像记录，按上传时间降序排列
     需要Bearer token认证
     """
     try:
-        images = await crud_images.get_all_images(db)
-        return images
+        images = await crud_images.get_all_images(db, current_user.id)
+        return [
+            ImageResponse.model_validate({
+                "id": image.id,
+                "image_name": image.image_name,
+                "resolution": image.resolution,
+                "capture_date": image.capture_date,
+                "satellite": image.satellite,
+                "image_type": image.image_type,
+                "region_code": image.region_code,
+                "img_path": image.img_path,
+                "shp_path": _pick_shp_path(image),
+                "upload_time": image.upload_time,
+            })
+            for image in images
+        ]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取影像列表失败: {str(exc)}")
 
 
 @router.get("/{image_id}", response_model=ImageResponse, summary="根据ID获取影像")
-async def get_image(image_id: int, db: AsyncSession = Depends(get_db)):
+async def get_image(image_id: int, db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
     """
-    根据ID获取单个影像记录
+    根据ID获取当前用户的影像记录
     """
-    image = await crud_images.get_image_by_id(db, image_id)
+    image = await crud_images.get_image_by_id(db, image_id, current_user.id)
     if not image:
         raise HTTPException(status_code=404, detail="影像不存在")
-    return image
+    return ImageResponse.model_validate({
+        "id": image.id,
+        "image_name": image.image_name,
+        "resolution": image.resolution,
+        "capture_date": image.capture_date,
+        "satellite": image.satellite,
+        "image_type": image.image_type,
+        "region_code": image.region_code,
+        "img_path": image.img_path,
+        "shp_path": _pick_shp_path(image),
+        "upload_time": image.upload_time,
+    })

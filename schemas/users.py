@@ -8,3 +8,11 @@ class UserRequest(BaseModel):
 class UserLoginRequest(BaseModel):
     telNum: str = Query(..., description="电话号码")
     password: str = Query(..., description="密码")
+
+class UserUpdateRequest(BaseModel):
+    name: str = Query(..., description="用户名")
+    telNum: str = Query(..., description="电话号码")
+
+class UserUpdatePassword(BaseModel):
+    oldPassword: str = Query(..., description="旧密码")
+    password: str = Query(..., description="新密码")

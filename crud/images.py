@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from models.images import Image, BoundaryFile
 from datetime import datetime
 from typing import List, Optional
@@ -7,6 +8,7 @@ from typing import List, Optional
 
 async def create_image(
     db: AsyncSession,
+    user_id: int,
     image_name: str,
     resolution: float,
     capture_date,
@@ -17,6 +19,7 @@ async def create_image(
 ) -> Image:
     """创建新的影像记录"""
     db_image = Image(
+        user_id=user_id,
         image_name=image_name,
         resolution=resolution,
         capture_date=capture_date,
@@ -54,18 +57,22 @@ async def create_boundary_files(
     return db_boundary
 
 
-async def get_all_images(db: AsyncSession) -> List[Image]:
-    """获取所有影像记录"""
+async def get_all_images(db: AsyncSession, user_id: int) -> List[Image]:
+    """获取当前用户的影像记录"""
     result = await db.execute(
-        select(Image).order_by(Image.upload_time.desc())
+        select(Image)
+        .options(selectinload(Image.boundary_files))
+        .where(Image.user_id == user_id)
+        .order_by(Image.upload_time.desc())
     )
-    return result.scalars().all()
+    return list(result.scalars().all())
 
 
-async def get_image_by_id(db: AsyncSession, image_id: int) -> Optional[Image]:
-    """根据ID获取影像记录"""
+async def get_image_by_id(db: AsyncSession, image_id: int, user_id: int) -> Optional[Image]:
+    """根据ID获取当前用户的影像记录"""
     result = await db.execute(
-        select(Image).where(Image.id == image_id)
+        select(Image)
+        .options(selectinload(Image.boundary_files))
+        .where(Image.id == image_id, Image.user_id == user_id)
     )
     return result.scalar_one_or_none()
-
