@@ -205,12 +205,16 @@ async def _save_shp_and_create_records(
     return db_image
 
 
-def _pick_shp_path(image) -> Optional[str]:
+def _pick_boundary_paths(image) -> dict:
     boundary_files = getattr(image, "boundary_files", None) or []
     for bf in boundary_files:
-        if getattr(bf, "shp_path", None):
-            return bf.shp_path
-    return None
+        if getattr(bf, "shp_path", None) or getattr(bf, "dbf_path", None) or getattr(bf, "prj_path", None):
+            return {
+                "shp_path": getattr(bf, "shp_path", None),
+                "dbf_path": getattr(bf, "dbf_path", None),
+                "prj_path": getattr(bf, "prj_path", None),
+            }
+    return {"shp_path": None, "dbf_path": None, "prj_path": None}
 
 
 @router.post("/upload/init", summary="初始化分片上传")
@@ -490,13 +494,42 @@ async def get_images_list(db: AsyncSession = Depends(get_db), current_user=Depen
                 "image_type": image.image_type,
                 "region_code": image.region_code,
                 "img_path": image.img_path,
-                "shp_path": _pick_shp_path(image),
+                **_pick_boundary_paths(image),
                 "upload_time": image.upload_time,
             })
             for image in images
         ]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取影像列表失败: {str(exc)}")
+
+
+@router.get("/search", summary="搜索影像")
+async def search_images(
+    q: Optional[str] = Query(None, description="影像名称关键字"),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """按名称模糊搜索当前用户影像，返回数组。"""
+    try:
+        images = await crud_images.search_images(db, current_user.id, q)
+        data = [
+            ImageResponse.model_validate({
+                "id": image.id,
+                "image_name": image.image_name,
+                "resolution": image.resolution,
+                "capture_date": image.capture_date,
+                "satellite": image.satellite,
+                "image_type": image.image_type,
+                "region_code": image.region_code,
+                "img_path": image.img_path,
+                **_pick_boundary_paths(image),
+                "upload_time": image.upload_time,
+            }).model_dump(mode="json")
+            for image in images
+        ]
+        return success_response(message="搜索成功", data=data)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"搜索影像失败: {str(exc)}")
 
 
 @router.get("/{image_id}", response_model=ImageResponse, summary="根据ID获取影像")
@@ -516,6 +549,217 @@ async def get_image(image_id: int, db: AsyncSession = Depends(get_db), current_u
         "image_type": image.image_type,
         "region_code": image.region_code,
         "img_path": image.img_path,
-        "shp_path": _pick_shp_path(image),
+        **_pick_boundary_paths(image),
         "upload_time": image.upload_time,
     })
+
+
+def _safe_unlink(file_path: Optional[str]) -> None:
+    if not file_path:
+        return
+    try:
+        Path(file_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _save_upload_file(upload: UploadFile, target_dir: Path, filename: str) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    save_path = target_dir / filename
+    with save_path.open("wb") as buffer:
+        shutil.copyfileobj(upload.file, buffer)
+    return save_path
+
+
+def _extract_shp_group(
+    shp_files: Optional[List[UploadFile]],
+    shp_file: Optional[UploadFile],
+    dbf_file: Optional[UploadFile],
+    prj_file: Optional[UploadFile],
+) -> dict:
+    result = {
+        "shp": shp_file,
+        "dbf": dbf_file,
+        "prj": prj_file,
+    }
+    for file_item in shp_files or []:
+        if not file_item or not file_item.filename:
+            continue
+        lower_name = file_item.filename.lower()
+        if lower_name.endswith(".shp"):
+            result["shp"] = file_item
+        elif lower_name.endswith(".dbf"):
+            result["dbf"] = file_item
+        elif lower_name.endswith(".prj"):
+            result["prj"] = file_item
+    return result
+
+
+@router.put("/update/{image_id}", summary="编辑影像")
+async def edit_image(
+    image_id: int,
+    image_name: Optional[str] = Form(None, description="影像名称"),
+    resolution: Optional[float] = Form(None, description="影像分辨率"),
+    capture_date: Optional[str] = Form(None, description="拍摄日期，支持 YYYY-MM-DD 或 JS Date 字符串"),
+    satellite: Optional[str] = Form(None, description="卫星名称"),
+    image_type: Optional[str] = Form(None, alias="type", description="影像类型"),
+    region_code: Optional[str] = Form(None, description="区域代码"),
+    image_file: Optional[UploadFile] = File(None, description="遥感影像文件（可选，.tif/.tiff）"),
+    shp_files: Optional[List[UploadFile]] = File(None, description="边界文件（可选，支持 .shp/.dbf/.prj）"),
+    shp_file: Optional[UploadFile] = File(None, description="单独上传 .shp（可选）"),
+    dbf_file: Optional[UploadFile] = File(None, description="单独上传 .dbf（可选）"),
+    prj_file: Optional[UploadFile] = File(None, description="单独上传 .prj（可选）"),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    image = await crud_images.get_image_by_id(db, image_id, current_user.id)
+    if not image:
+        raise HTTPException(status_code=404, detail="影像不存在")
+
+    new_files: List[Path] = []
+    old_files_to_delete: List[str] = []
+
+    try:
+        updates = {}
+        if image_name is not None:
+            updates["image_name"] = image_name
+        if resolution is not None:
+            updates["resolution"] = resolution
+        if capture_date is not None:
+            updates["capture_date"] = parse_capture_date(capture_date)
+        if satellite is not None:
+            updates["satellite"] = satellite
+        if image_type is not None:
+            updates["image_type"] = image_type
+        if region_code is not None:
+            updates["region_code"] = region_code
+
+        final_image_name = image_name if image_name is not None else image.image_name
+        final_region_code = region_code if region_code is not None else image.region_code
+        file_prefix = f"{final_region_code}_{final_image_name}"
+
+        if image_file is not None:
+            if not image_file.filename or not image_file.filename.lower().endswith((".tif", ".tiff")):
+                raise HTTPException(status_code=422, detail="image_file 必须是 .tif 或 .tiff 文件")
+
+            tif_filename = f"{file_prefix}_{image.id}_{Path(image_file.filename).name}"
+            tif_path = _save_upload_file(image_file, IMAGE_DIR, tif_filename)
+            new_files.append(tif_path)
+
+            if image.img_path and image.img_path != str(tif_path):
+                old_files_to_delete.append(image.img_path)
+            updates["img_path"] = str(tif_path)
+
+        shp_group = _extract_shp_group(shp_files, shp_file, dbf_file, prj_file)
+        boundary_updates = {}
+        shp_dir = SHAPEFILE_DIR / file_prefix
+
+        if shp_group["shp"] is not None:
+            shp_upload = shp_group["shp"]
+            if not shp_upload.filename or not shp_upload.filename.lower().endswith(".shp"):
+                raise HTTPException(status_code=422, detail="shp_file 必须是 .shp 文件")
+            shp_path = _save_upload_file(shp_upload, shp_dir, Path(shp_upload.filename).name)
+            new_files.append(shp_path)
+            boundary_updates["shp_path"] = str(shp_path)
+
+        if shp_group["dbf"] is not None:
+            dbf_upload = shp_group["dbf"]
+            if not dbf_upload.filename or not dbf_upload.filename.lower().endswith(".dbf"):
+                raise HTTPException(status_code=422, detail="dbf_file 必须是 .dbf 文件")
+            dbf_path = _save_upload_file(dbf_upload, shp_dir, Path(dbf_upload.filename).name)
+            new_files.append(dbf_path)
+            boundary_updates["dbf_path"] = str(dbf_path)
+
+        if shp_group["prj"] is not None:
+            prj_upload = shp_group["prj"]
+            if not prj_upload.filename or not prj_upload.filename.lower().endswith(".prj"):
+                raise HTTPException(status_code=422, detail="prj_file 必须是 .prj 文件")
+            prj_path = _save_upload_file(prj_upload, shp_dir, Path(prj_upload.filename).name)
+            new_files.append(prj_path)
+            boundary_updates["prj_path"] = str(prj_path)
+
+        old_boundary = _pick_boundary_paths(image)
+        if updates:
+            await crud_images.update_image_fields(db, image, updates)
+
+        if boundary_updates or updates:
+            await crud_images.upsert_boundary_files(
+                db,
+                image,
+                file_prefix=file_prefix,
+                shp_path=boundary_updates.get("shp_path"),
+                dbf_path=boundary_updates.get("dbf_path"),
+                prj_path=boundary_updates.get("prj_path"),
+            )
+
+        await db.commit()
+
+        if "shp_path" in boundary_updates and old_boundary.get("shp_path") and old_boundary.get("shp_path") != boundary_updates["shp_path"]:
+            old_files_to_delete.append(old_boundary["shp_path"])
+        if "dbf_path" in boundary_updates and old_boundary.get("dbf_path") and old_boundary.get("dbf_path") != boundary_updates["dbf_path"]:
+            old_files_to_delete.append(old_boundary["dbf_path"])
+        if "prj_path" in boundary_updates and old_boundary.get("prj_path") and old_boundary.get("prj_path") != boundary_updates["prj_path"]:
+            old_files_to_delete.append(old_boundary["prj_path"])
+
+        for old_file in old_files_to_delete:
+            _safe_unlink(old_file)
+
+        refreshed = await crud_images.get_image_by_id(db, image_id, current_user.id)
+        if not refreshed:
+            raise HTTPException(status_code=404, detail="影像不存在")
+
+        boundary_snapshot = _pick_boundary_paths(refreshed)
+
+        image_payload = ImageResponse.model_validate({
+            "id": refreshed.id,
+            "image_name": refreshed.image_name,
+            "resolution": refreshed.resolution,
+            "capture_date": refreshed.capture_date,
+            "satellite": refreshed.satellite,
+            "image_type": refreshed.image_type,
+            "region_code": refreshed.region_code,
+            "img_path": refreshed.img_path,
+            **boundary_snapshot,
+            "upload_time": refreshed.upload_time,
+        })
+        return success_response(message="影像编辑成功", data=image_payload.model_dump(mode="json"))
+
+    except HTTPException:
+        await db.rollback()
+        for file_path in new_files:
+            _safe_unlink(str(file_path))
+        raise
+    except Exception as exc:
+        await db.rollback()
+        for file_path in new_files:
+            _safe_unlink(str(file_path))
+        raise HTTPException(status_code=500, detail=f"编辑影像失败: {str(exc)}")
+
+
+@router.delete('/delete/{image_id}', summary='删除影像')
+async def delete_image(
+    image_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    try:
+        deleted = await crud_images.delete_image_with_files(db, image_id, current_user.id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="影像不存在")
+
+        await db.commit()
+
+        _safe_unlink(deleted.get("img_path"))
+        for file_path in deleted.get("boundary_paths", []):
+            _safe_unlink(file_path)
+
+        return success_response(
+            message="影像删除成功",
+            data={"id": image_id},
+        )
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"删除影像失败: {str(exc)}")
