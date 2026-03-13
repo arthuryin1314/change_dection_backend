@@ -13,10 +13,12 @@ from pydantic import BaseModel
 from config.db_config import get_db
 from crud import images as crud_images
 from schemas.images import ImageResponse
+from utils.geoserver_utils import publish_geotiff_layer, get_tif_bbox_wgs84
 from utils.response import success_response
 from utils.date_parser import parse_capture_date
 from utils.get_user_by_token import get_current_user
-
+from utils.geoserver_utils import logger
+from utils.geoserver_utils import GEOSERVER_URL, GEOSERVER_WORKSPACE
 router = APIRouter(prefix="/api/images", tags=["images"])
 
 # 配置上传目录
@@ -63,7 +65,7 @@ def _save_meta(upload_id: str, meta: dict) -> None:
     meta_file = _meta_path(upload_id)
     meta_file.parent.mkdir(parents=True, exist_ok=True)
     temp_file = meta_file.with_suffix(".tmp")
-    temp_file.write_text(json.dumps(meta), encoding="utf-8")
+    temp_file.write_text(json.dumps(meta, ensure_ascii=False, default=str), encoding="utf-8")
     temp_file.replace(meta_file)
 
 
@@ -144,6 +146,14 @@ def _find_upload_id_by_hash(file_hash: str, user_id: int) -> Optional[str]:
     return latest_upload_id
 
 
+def _save_upload_stream(src, dst, chunk_size: int = 1024 * 1024) -> None:
+    while True:
+        chunk = src.read(chunk_size)
+        if not chunk:
+            break
+        dst.write(chunk)
+
+
 async def _save_shp_and_create_records(
     db: AsyncSession,
     user_id: int,
@@ -155,6 +165,9 @@ async def _save_shp_and_create_records(
     region_code: str,
     tif_path: Path,
     shp_files: List[UploadFile],
+    bbox: Optional[List[float]] = None,
+    layer_name: Optional[str] = None,
+    wms_url: Optional[str] = None,
 ):
     parsed_capture_date = parse_capture_date(capture_date)
 
@@ -171,7 +184,7 @@ async def _save_shp_and_create_records(
 
         save_path = shp_dir / Path(shp_file.filename).name
         with save_path.open("wb") as buffer:
-            shutil.copyfileobj(shp_file.file, buffer)
+            _save_upload_stream(shp_file.file, buffer)
 
         lower_name = shp_file.filename.lower()
         if lower_name.endswith(".shp"):
@@ -191,6 +204,9 @@ async def _save_shp_and_create_records(
         image_type=image_type,
         region_code=region_code,
         img_path=str(tif_path),
+        bbox=bbox,
+        layer_name=layer_name,
+        wms_url=wms_url,
     )
 
     await crud_images.create_boundary_files(
@@ -215,6 +231,50 @@ def _pick_boundary_paths(image) -> dict:
                 "prj_path": getattr(bf, "prj_path", None),
             }
     return {"shp_path": None, "dbf_path": None, "prj_path": None}
+
+
+def _build_layer_name(region_code: Optional[str], image_name: Optional[str], image_id: Optional[int]) -> Optional[str]:
+    if not region_code or not image_name or image_id is None:
+        return None
+    return f"{region_code}_{image_name}_{image_id}".replace(" ", "_")
+
+
+def _build_wms_url(layer_name: Optional[str]) -> Optional[str]:
+    if not layer_name:
+        return None
+    return (
+        f"{GEOSERVER_URL}/{GEOSERVER_WORKSPACE}/wms"
+        f"?service=WMS&version=1.1.0&request=GetMap"
+        f"&layers={GEOSERVER_WORKSPACE}:{layer_name}"
+        f"&format=image/png"
+    )
+
+
+def _build_layer_info(image) -> dict:
+    stored_layer_name = getattr(image, "layer_name", None)
+    stored_wms_url = getattr(image, "wms_url", None)
+    if stored_layer_name or stored_wms_url:
+        return {"layer_name": stored_layer_name, "wms_url": stored_wms_url}
+
+    layer_name = _build_layer_name(image.region_code, image.image_name, image.id)
+    return {"layer_name": layer_name, "wms_url": _build_wms_url(layer_name)}
+
+
+def _serialize_image(image) -> dict:
+    return {
+        "id": image.id,
+        "image_name": image.image_name,
+        "resolution": image.resolution,
+        "capture_date": image.capture_date,
+        "satellite": image.satellite,
+        "image_type": image.image_type,
+        "region_code": image.region_code,
+        "img_path": image.img_path,
+        "bbox": getattr(image, "bbox", None),
+        **_build_layer_info(image),
+        **_pick_boundary_paths(image),
+        "upload_time": image.upload_time,
+    }
 
 
 @router.post("/upload/init", summary="初始化分片上传")
@@ -306,12 +366,16 @@ async def upload_chunk(
     part_path.parent.mkdir(parents=True, exist_ok=True)
 
     with part_path.open("wb") as buffer:
-        shutil.copyfileobj(chunk_data.file, buffer)
+        _save_upload_stream(chunk_data.file, buffer)
 
     meta["status"] = "uploading"
     _save_meta(upload_id, meta)
 
     return success_response(message="分片上传成功", data={"upload_id": upload_id, "chunk_index": chunk_index})
+
+
+def _serialize_image_json(image) -> dict:
+    return ImageResponse.model_validate(_serialize_image(image)).model_dump(mode="json")
 
 
 @router.post("/upload/complete", summary="完成分片上传并入库")
@@ -345,6 +409,7 @@ async def complete_upload(
         raise HTTPException(status_code=409, detail="该上传正在合并，请稍后重试")
 
     tif_path: Optional[Path] = None
+    db_image = None
     try:
         total_chunks = int(meta["total_chunks"])
         chunk_size = int(meta["chunk_size"])
@@ -381,11 +446,12 @@ async def complete_upload(
             for idx in required:
                 part_path = _chunks_dir(upload_id) / f"{idx}.part"
                 with part_path.open("rb") as part_file:
-                    shutil.copyfileobj(part_file, merged_file)
+                    _save_upload_stream(part_file, merged_file)
 
         if tif_path.stat().st_size != file_size:
             raise HTTPException(status_code=422, detail="合并后文件大小校验失败")
 
+        bbox = get_tif_bbox_wgs84(tif_path)
         db_image = await _save_shp_and_create_records(
             db=db,
             user_id=current_user.id,
@@ -397,20 +463,45 @@ async def complete_upload(
             region_code=region_code,
             tif_path=tif_path,
             shp_files=shp_files,
+            bbox=bbox,
         )
         await db.commit()
 
+        layer_name = _build_layer_name(region_code, image_name, db_image.id)
+        wms_url = None
+        published = False
+        geoserver_error = None
+
+        if layer_name and tif_path is not None:
+            try:
+                wms_url = await publish_geotiff_layer(tif_path=tif_path, layer_name=layer_name)
+                await crud_images.update_image_fields(
+                    db,
+                    db_image,
+                    {"layer_name": layer_name, "wms_url": wms_url},
+                )
+                await db.commit()
+                published = True
+            except Exception as exc:
+                await db.rollback()
+                geoserver_error = str(exc)
+                logger.error(f"[GeoServer] 分片上传发布失败（数据已入库 id={db_image.id}）: {exc}")
+
+        refreshed = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
+        payload_image = refreshed or db_image
         result = {
-            "id": db_image.id,
-            "image_name": db_image.image_name,
-            "img_path": db_image.img_path,
+            **_serialize_image_json(payload_image),
             "upload_id": upload_id,
+            "published": published,
         }
+        if geoserver_error:
+            result["geoserver_error"] = geoserver_error
         meta["status"] = "completed"
         meta["result"] = result
         _save_meta(upload_id, meta)
 
-        return success_response(message="影像上传成功", data=result)
+        msg = "影像上传成功" if published else "影像已入库，GeoServer 图层发布失败，请稍后手动发布"
+        return success_response(message=msg, data=result)
 
     except HTTPException:
         await db.rollback()
@@ -420,34 +511,54 @@ async def complete_upload(
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         await db.rollback()
+        # GeoServer 发布失败或其他提交后异常：主记录可能已入库，尽量返回降级成功结果
+        if db_image is not None:
+            logger.error(f"[GeoServer] 发布失败（数据已入库 id={db_image.id}）: {exc}")
+            payload_image = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
+            payload_image = payload_image or db_image
+            return success_response(
+                message="影像已入库，GeoServer 图层发布失败，请稍后手动发布",
+                data={
+                    **(_serialize_image_json(payload_image) if payload_image else {}),
+                    "published": False,
+                    "geoserver_error": str(exc),
+                },
+            )
+        # 入库前出错：清理已落盘的 TIF
+        if tif_path and tif_path.exists():
+            tif_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"上传失败: {str(exc)}")
-    finally:
-        if lock_path.exists():
-            lock_path.unlink(missing_ok=True)
 
 
 @router.post("/upload", summary="上传影像（整文件，兼容旧流程）")
 async def upload_image(
-    image_name: str = Form(..., description="影像名称"),
-    resolution: float = Form(..., description="影像分辨率"),
-    capture_date: str = Form(..., description="拍摄日期，支持 YYYY-MM-DD 或 JS Date 字符串"),
-    satellite: str = Form(..., description="卫星名称"),
-    image_type: str = Form(..., alias="type", description="影像类型"),
-    region_code: str = Form(..., description="区域代码"),
-    image_file: UploadFile = File(..., description="遥感影像文件（必填，.tif/.tiff）"),
-    shp_files: List[UploadFile] = File(..., description="Shapefile文件（必填，.shp, .dbf, .prj等）"),
+    image_name: str = Form(...),
+    resolution: float = Form(...),
+    capture_date: str = Form(...),
+    satellite: str = Form(...),
+    image_type: str = Form(..., alias="type"),
+    region_code: str = Form(...),
+    image_file: UploadFile = File(...),
+    shp_files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
+    tif_path: Optional[Path] = None
+    db_image = None
+
     try:
         if not image_file.filename or not image_file.filename.lower().endswith((".tif", ".tiff")):
             raise ValueError("image_file 必须是 .tif 或 .tiff 文件")
 
+        # ── 1. 保存 TIF ──────────────────────────────────────────────────
         tif_filename = f"{region_code}_{image_name}_{Path(image_file.filename).name}"
-        tif_path = IMAGE_DIR / tif_filename
+        tif_path = IMAGE_DIR / tif_filename        # E:\change_detection\...\images\xxx.tif
         with tif_path.open("wb") as buffer:
-            shutil.copyfileobj(image_file.file, buffer)
+            _save_upload_stream(image_file.file, buffer)
 
+        bbox = get_tif_bbox_wgs84(tif_path)
+
+        # ── 2. 写入数据库 ────────────────────────────────────────────────
         db_image = await _save_shp_and_create_records(
             db=db,
             user_id=current_user.id,
@@ -459,46 +570,89 @@ async def upload_image(
             region_code=region_code,
             tif_path=tif_path,
             shp_files=shp_files,
+            bbox=bbox,
         )
-
         await db.commit()
 
+        # ── 3. 发布到 GeoServer ──────────────────────────────────────────
+        layer_name = _build_layer_name(region_code, image_name, db_image.id)
+        wms_url = None
+
+        if not layer_name:
+            raise RuntimeError("无法生成图层名称")
+
+        wms_url = await publish_geotiff_layer(
+            tif_path=tif_path,
+            layer_name=layer_name,
+        )
+        await crud_images.update_image_fields(
+            db,
+            db_image,
+            {"layer_name": layer_name, "wms_url": wms_url},
+        )
+        await db.commit()
+
+        refreshed = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
+        payload_image = refreshed or db_image
         return success_response(
             message="影像上传成功",
-            data={"id": db_image.id, "image_name": db_image.image_name, "img_path": db_image.img_path},
+            data={
+                **_serialize_image_json(payload_image),
+                "published": True,
+            },
         )
 
     except ValueError as exc:
         await db.rollback()
         raise HTTPException(status_code=422, detail=str(exc))
+
     except Exception as exc:
         await db.rollback()
+        # GeoServer 发布失败或其他提交后异常：主记录可能已入库，尽量返回降级成功结果
+        if db_image is not None:
+            logger.error(f"[GeoServer] 发布失败（数据已入库 id={db_image.id}）: {exc}")
+            payload_image = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
+            payload_image = payload_image or db_image
+            return success_response(
+                message="影像已入库，GeoServer 图层发布失败，请稍后手动发布",
+                data={
+                    **(_serialize_image_json(payload_image) if payload_image else {}),
+                    "published": False,
+                    "geoserver_error": str(exc),
+                },
+            )
+        # 入库前出错：清理已落盘的 TIF
+        if tif_path and tif_path.exists():
+            tif_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"上传失败: {str(exc)}")
 
 
-@router.get("/list", response_model=List[ImageResponse], summary="获取所有影像列表")
-async def get_images_list(db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
+@router.get("/list", summary="获取分页影像列表")
+async def get_images_list(
+        page:int=Query(1,ge=1,description='页码从1开始'),
+        page_size:int=Query(10,ge=1,description='每页默认展示10条',alias='pageSize'),
+        db: AsyncSession = Depends(get_db),
+        current_user=Depends(get_current_user)
+):
     """
     获取当前用户的影像记录，按上传时间降序排列
     需要Bearer token认证
     """
     try:
-        images = await crud_images.get_all_images(db, current_user.id)
-        return [
-            ImageResponse.model_validate({
-                "id": image.id,
-                "image_name": image.image_name,
-                "resolution": image.resolution,
-                "capture_date": image.capture_date,
-                "satellite": image.satellite,
-                "image_type": image.image_type,
-                "region_code": image.region_code,
-                "img_path": image.img_path,
-                **_pick_boundary_paths(image),
-                "upload_time": image.upload_time,
-            })
+        offset = (page - 1) * page_size
+        images,total_count = await crud_images.get_paginated_images(db, current_user.id,offset, page_size)
+        data = [
+            ImageResponse.model_validate(_serialize_image(image)).model_dump(mode="json")
             for image in images
         ]
+        return success_response(message='获取成功',data={
+            "items":data,
+            "total":total_count,
+            "page":page,
+            "page_size":page_size,
+            "total_pages":(total_count + page_size - 1) // page_size
+
+        })
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取影像列表失败: {str(exc)}")
 
@@ -513,18 +667,7 @@ async def search_images(
     try:
         images = await crud_images.search_images(db, current_user.id, q)
         data = [
-            ImageResponse.model_validate({
-                "id": image.id,
-                "image_name": image.image_name,
-                "resolution": image.resolution,
-                "capture_date": image.capture_date,
-                "satellite": image.satellite,
-                "image_type": image.image_type,
-                "region_code": image.region_code,
-                "img_path": image.img_path,
-                **_pick_boundary_paths(image),
-                "upload_time": image.upload_time,
-            }).model_dump(mode="json")
+            ImageResponse.model_validate(_serialize_image(image)).model_dump(mode="json")
             for image in images
         ]
         return success_response(message="搜索成功", data=data)
@@ -540,18 +683,7 @@ async def get_image(image_id: int, db: AsyncSession = Depends(get_db), current_u
     image = await crud_images.get_image_by_id(db, image_id, current_user.id)
     if not image:
         raise HTTPException(status_code=404, detail="影像不存在")
-    return ImageResponse.model_validate({
-        "id": image.id,
-        "image_name": image.image_name,
-        "resolution": image.resolution,
-        "capture_date": image.capture_date,
-        "satellite": image.satellite,
-        "image_type": image.image_type,
-        "region_code": image.region_code,
-        "img_path": image.img_path,
-        **_pick_boundary_paths(image),
-        "upload_time": image.upload_time,
-    })
+    return ImageResponse.model_validate(_serialize_image(image))
 
 
 def _safe_unlink(file_path: Optional[str]) -> None:
@@ -567,7 +699,7 @@ def _save_upload_file(upload: UploadFile, target_dir: Path, filename: str) -> Pa
     target_dir.mkdir(parents=True, exist_ok=True)
     save_path = target_dir / filename
     with save_path.open("wb") as buffer:
-        shutil.copyfileobj(upload.file, buffer)
+        _save_upload_stream(upload.file, buffer)
     return save_path
 
 
@@ -649,6 +781,7 @@ async def edit_image(
             if image.img_path and image.img_path != str(tif_path):
                 old_files_to_delete.append(image.img_path)
             updates["img_path"] = str(tif_path)
+            updates["bbox"] = get_tif_bbox_wgs84(tif_path)
 
         shp_group = _extract_shp_group(shp_files, shp_file, dbf_file, prj_file)
         boundary_updates = {}
@@ -708,20 +841,7 @@ async def edit_image(
         if not refreshed:
             raise HTTPException(status_code=404, detail="影像不存在")
 
-        boundary_snapshot = _pick_boundary_paths(refreshed)
-
-        image_payload = ImageResponse.model_validate({
-            "id": refreshed.id,
-            "image_name": refreshed.image_name,
-            "resolution": refreshed.resolution,
-            "capture_date": refreshed.capture_date,
-            "satellite": refreshed.satellite,
-            "image_type": refreshed.image_type,
-            "region_code": refreshed.region_code,
-            "img_path": refreshed.img_path,
-            **boundary_snapshot,
-            "upload_time": refreshed.upload_time,
-        })
+        image_payload = ImageResponse.model_validate(_serialize_image(refreshed))
         return success_response(message="影像编辑成功", data=image_payload.model_dump(mode="json"))
 
     except HTTPException:

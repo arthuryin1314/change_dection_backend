@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select,func
 from sqlalchemy.orm import selectinload
 from models.images import Image, BoundaryFile
 from datetime import datetime
@@ -15,7 +15,10 @@ async def create_image(
     satellite: str,
     image_type: str,
     region_code: str,
-    img_path: str
+    img_path: str,
+    bbox: Optional[List[float]] = None,
+    layer_name: Optional[str] = None,
+    wms_url: Optional[str] = None,
 ) -> Image:
     """创建新的影像记录"""
     db_image = Image(
@@ -27,6 +30,9 @@ async def create_image(
         image_type=image_type,
         region_code=region_code,
         img_path=img_path,
+        bbox=bbox,
+        layer_name=layer_name,
+        wms_url=wms_url,
         upload_time=datetime.now()
     )
     db.add(db_image)
@@ -57,15 +63,23 @@ async def create_boundary_files(
     return db_boundary
 
 
-async def get_all_images(db: AsyncSession, user_id: int) -> List[Image]:
-    """获取当前用户的影像记录"""
-    result = await db.execute(
+async def get_paginated_images(db: AsyncSession, user_id: int,offset:int,limit:int):
+    """ 分页版本展示"""
+    query = select(func.count()).select_from(Image).where(Image.user_id == user_id)
+    count_result = await db.execute(query)
+    total_count = count_result.scalar() or 0
+
+    page_query = (
         select(Image)
         .options(selectinload(Image.boundary_files))
         .where(Image.user_id == user_id)
         .order_by(Image.upload_time.desc())
+        .offset(offset)
+        .limit(limit)
     )
-    return list(result.scalars().all())
+    result = await db.execute(page_query)
+    images = result.scalars().all()
+    return images,total_count
 
 
 async def get_image_by_id(db: AsyncSession, image_id: int, user_id: int) -> Optional[Image]:
@@ -164,5 +178,3 @@ async def search_images(
     stmt = stmt.order_by(Image.upload_time.desc())
     result = await db.execute(stmt)
     return list(result.scalars().all())
-
-

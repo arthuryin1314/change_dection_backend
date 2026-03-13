@@ -1,5 +1,5 @@
-from sqlalchemy import Column, Integer, String, Date, Text, DateTime, ForeignKey,Numeric, BigInteger
-from sqlalchemy.orm import relationship, DeclarativeBase
+from sqlalchemy import Column, Integer, String, Date, Text, DateTime, ForeignKey,Numeric, BigInteger, JSON
+from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
 from datetime import datetime
 from models.Base import Base
@@ -17,6 +17,9 @@ class Image(Base):
     region_code   = Column(String(20))
     boundary      = Column(Geometry(geometry_type='POLYGON', srid=4326))
     img_path      = Column(Text)
+    bbox          = Column(JSON, nullable=True)
+    layer_name    = Column(String(255), nullable=True)
+    wms_url       = Column(Text, nullable=True)
     upload_time   = Column(DateTime, default=datetime.now)
 
     # 关联 boundary_files

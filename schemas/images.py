@@ -25,6 +25,9 @@ class ImageResponse(BaseModel):
     image_type: Optional[str]
     region_code: Optional[str]
     img_path: Optional[str]
+    bbox: Optional[list[float]] = None
+    layer_name: Optional[str] = None
+    wms_url: Optional[str] = None
     shp_path: Optional[str] = None
     dbf_path: Optional[str] = None
     prj_path: Optional[str] = None
