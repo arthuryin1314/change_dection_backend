@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
@@ -5,7 +7,7 @@ from starlette import status
 from schemas.users import UserRequest, UserLoginRequest, UserUpdateRequest, UserUpdatePassword
 from config.db_config import get_db
 from crud.users import get_user_by_username,create_user, createToken,get_user_by_telNum, update_user_info as crud_update_user_info, \
-    check_old_password, clear_user_token, update_password as crud_update_password
+    check_old_password, clear_user_token, update_password as crud_update_password, delete_user as crud_delete_user
 from utils.get_user_by_token import get_current_user
 from utils.response import success_response
 from utils.security import verify_password
@@ -95,3 +97,43 @@ async def logout(current_user = Depends(get_current_user),db:AsyncSession = Depe
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     await db.commit()
     return success_response(message='退出登录成功')
+
+def _safe_unlink(file_path: str | None) -> None:
+    if not file_path:
+        return
+    try:
+        Path(file_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+@router.delete('/deleteUser',summary='注销用户')
+async def delete_user(
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        deleted = await crud_delete_user(db, current_user.id)
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+
+        await db.commit()
+
+        image_deleted = deleted.get("deleted_images", {})
+        for img_path in image_deleted.get("img_paths", []):
+            _safe_unlink(img_path)
+        for boundary_path in image_deleted.get("boundary_paths", []):
+            _safe_unlink(boundary_path)
+
+        return success_response(
+            message='注销成功',
+            data={
+                'id': current_user.id,
+                'deleted_images': image_deleted.get('deleted_count', 0),
+            },
+        )
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"注销失败: {str(exc)}")

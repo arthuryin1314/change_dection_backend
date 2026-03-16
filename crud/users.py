@@ -6,6 +6,7 @@ from models.users import User, UserToken
 from sqlalchemy import select
 from schemas.users import UserRequest, UserUpdateRequest
 from utils.security import get_password_hash, verify_password
+from crud import images as crud_images
 
 
 async def get_user_by_username(db:AsyncSession,username:str):
@@ -103,3 +104,26 @@ async def clear_user_token(db:AsyncSession,user_id:int):
     await db.delete(user_token)
     await db.flush()
     return True
+
+async def delete_user(db:AsyncSession,user_id:int):
+    deleted_images = await crud_images.delete_images_by_user_with_files(db, user_id)
+
+    query_token = select(UserToken).where(UserToken.user_id == user_id)
+    result = await db.execute(query_token)
+    user_token = result.scalar_one_or_none()
+    if user_token:
+        await db.delete(user_token)
+
+    query_user = select(User).where(User.id == user_id)
+    result = await db.execute(query_user)
+    db_user = result.scalar_one_or_none()
+    if not db_user:
+        return None
+
+    await db.delete(db_user)
+    await db.flush()
+
+    return {
+        "user_id": user_id,
+        "deleted_images": deleted_images,
+    }

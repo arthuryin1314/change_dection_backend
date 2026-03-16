@@ -157,6 +157,42 @@ async def delete_image_with_files(db: AsyncSession, image_id: int, user_id: int)
         "boundary_paths": boundary_paths,
     }
 
+
+async def delete_images_by_user_with_files(db: AsyncSession, user_id: int) -> Dict[str, Any]:
+    """删除当前用户全部影像及边界文件记录，返回待清理文件路径。"""
+    result = await db.execute(
+        select(Image)
+        .options(selectinload(Image.boundary_files))
+        .where(Image.user_id == user_id)
+    )
+    images = list(result.scalars().all())
+
+    image_paths: List[str] = []
+    boundary_paths: List[str] = []
+
+    for image in images:
+        if image.img_path:
+            image_paths.append(image.img_path)
+
+        for bf in image.boundary_files:
+            if bf.shp_path:
+                boundary_paths.append(bf.shp_path)
+            if bf.dbf_path:
+                boundary_paths.append(bf.dbf_path)
+            if bf.prj_path:
+                boundary_paths.append(bf.prj_path)
+            await db.delete(bf)
+
+        await db.delete(image)
+
+    await db.flush()
+    return {
+        "deleted_count": len(images),
+        "img_paths": image_paths,
+        "boundary_paths": boundary_paths,
+    }
+
+
 # crud/images.py
 async def search_images(
     db: AsyncSession,
