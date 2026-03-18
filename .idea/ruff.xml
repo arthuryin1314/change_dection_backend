@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="RuffConfigService">
+    <option name="globalRuffExecutablePath" value="E:\anaconda3\Scripts\ruff.exe" />
     <option name="nativeRuffSupportNotificationDismissed" value="true" />
   </component>
 </project>

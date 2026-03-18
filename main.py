@@ -15,11 +15,3 @@ app.add_middleware(
 app.include_router(users.router)
 app.include_router(images.router)
 register_exception_handlers(app)
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
-
-
-@app.get("/hello/{name}")
-async def say_hello(name: str):
-    return {"message": f"Hello {name}"}
