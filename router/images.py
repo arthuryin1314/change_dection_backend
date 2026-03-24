@@ -2,12 +2,13 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Q
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 import logging
+import re
 import shutil
 from pathlib import Path
 import json
 import os
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 
@@ -41,6 +42,52 @@ COMPLETE_LOCK_FILE = ".complete.lock"
 UPLOAD_TTL_SECONDS = 24 * 60 * 60
 
 
+_UPLOAD_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _validate_upload_id(upload_id: str) -> str:
+    value = (upload_id or "").strip()
+    if not _UPLOAD_ID_RE.fullmatch(value):
+        raise HTTPException(status_code=422, detail="upload_id 格式非法")
+    # Use UUID parser as a strict second check.
+    UUID(hex=value)
+    return value.lower()
+
+
+def _sanitize_path_component(value: str, field_name: str, max_len: int = 64) -> str:
+    raw = (value or "").strip()
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", raw)
+    cleaned = cleaned.strip(" .")
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    if not cleaned or cleaned in {".", ".."}:
+        raise HTTPException(status_code=422, detail=f"{field_name} 非法")
+    return cleaned[:max_len]
+
+
+def _sanitize_upload_filename(filename: str, max_len: int = 128) -> str:
+    name = Path(filename or "").name
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
+    cleaned = cleaned.strip(" .")
+    if not cleaned or cleaned in {".", ".."}:
+        raise HTTPException(status_code=422, detail="文件名非法")
+    return cleaned[:max_len]
+
+
+def _safe_join(base_dir: Path, *parts: str) -> Path:
+    base = base_dir.resolve()
+    candidate = base_dir.joinpath(*parts)
+    candidate_resolved = candidate.resolve()
+    if candidate_resolved != base and base not in candidate_resolved.parents:
+        raise HTTPException(status_code=422, detail="文件路径非法")
+    return candidate
+
+
+def _build_safe_file_prefix(region_code: str, image_name: str) -> str:
+    safe_region_code = _sanitize_path_component(region_code, "region_code")
+    safe_image_name = _sanitize_path_component(image_name, "image_name")
+    return f"{safe_region_code}_{safe_image_name}"
+
+
 class UploadInitRequest(BaseModel):
     file_hash: str
     file_name: str
@@ -50,7 +97,8 @@ class UploadInitRequest(BaseModel):
 
 
 def _session_dir(upload_id: str) -> Path:
-    return TMP_UPLOAD_DIR / upload_id
+    safe_upload_id = _validate_upload_id(upload_id)
+    return _safe_join(TMP_UPLOAD_DIR, safe_upload_id)
 
 
 def _meta_path(upload_id: str) -> Path:
@@ -169,11 +217,13 @@ async def _save_shp_and_create_records(
     bbox: Optional[List[float]] = None,
     layer_name: Optional[str] = None,
     wms_url: Optional[str] = None,
+    safe_file_prefix: Optional[str] = None,
 ):
     parsed_capture_date = parse_capture_date(capture_date)
 
-    shp_dir = SHAPEFILE_DIR / f"{region_code}_{image_name}"
-    shp_dir.mkdir(exist_ok=True)
+    file_prefix = safe_file_prefix or _build_safe_file_prefix(region_code, image_name)
+    shp_dir = _safe_join(SHAPEFILE_DIR, file_prefix)
+    shp_dir.mkdir(parents=True, exist_ok=True)
 
     shp_path = None
     dbf_path = None
@@ -183,11 +233,12 @@ async def _save_shp_and_create_records(
         if not shp_file.filename:
             continue
 
-        save_path = shp_dir / Path(shp_file.filename).name
+        safe_name = _sanitize_upload_filename(shp_file.filename)
+        save_path = _safe_join(shp_dir, safe_name)
         with save_path.open("wb") as buffer:
             _save_upload_stream(shp_file.file, buffer)
 
-        lower_name = shp_file.filename.lower()
+        lower_name = safe_name.lower()
         if lower_name.endswith(".shp"):
             shp_path = str(save_path)
         elif lower_name.endswith(".dbf"):
@@ -213,7 +264,7 @@ async def _save_shp_and_create_records(
     await crud_images.create_boundary_files(
         db=db,
         image_id=db_image.id,
-        file_prefix=f"{region_code}_{image_name}",
+        file_prefix=file_prefix,
         shp_path=shp_path,
         dbf_path=dbf_path,
         prj_path=prj_path,
@@ -222,14 +273,32 @@ async def _save_shp_and_create_records(
     return db_image
 
 
+def _to_public_path(path_value: Optional[str]) -> Optional[str]:
+    if not path_value:
+        return None
+
+    normalized = str(path_value).replace("\\", "/")
+    lower_normalized = normalized.lower()
+
+    marker = "/uploads/"
+    marker_idx = lower_normalized.find(marker)
+    if marker_idx >= 0:
+        return normalized[marker_idx + 1 :]
+
+    if lower_normalized.startswith("uploads/"):
+        return normalized
+
+    return Path(normalized).name
+
+
 def _pick_boundary_paths(image) -> dict:
     boundary_files = getattr(image, "boundary_files", None) or []
     for bf in boundary_files:
         if getattr(bf, "shp_path", None) or getattr(bf, "dbf_path", None) or getattr(bf, "prj_path", None):
             return {
-                "shp_path": getattr(bf, "shp_path", None),
-                "dbf_path": getattr(bf, "dbf_path", None),
-                "prj_path": getattr(bf, "prj_path", None),
+                "shp_path": _to_public_path(getattr(bf, "shp_path", None)),
+                "dbf_path": _to_public_path(getattr(bf, "dbf_path", None)),
+                "prj_path": _to_public_path(getattr(bf, "prj_path", None)),
             }
     return {"shp_path": None, "dbf_path": None, "prj_path": None}
 
@@ -270,7 +339,7 @@ def _serialize_image(image) -> dict:
         "satellite": image.satellite,
         "image_type": image.image_type,
         "region_code": image.region_code,
-        "img_path": image.img_path,
+        "img_path": _to_public_path(getattr(image, "img_path", None)),
         "bbox": getattr(image, "bbox", None),
         **_build_layer_info(image),
         **_pick_boundary_paths(image),
@@ -323,6 +392,7 @@ async def get_upload_status(
     if not resolved_upload_id:
         raise HTTPException(status_code=404, detail="未找到上传会话")
 
+    resolved_upload_id = _validate_upload_id(resolved_upload_id)
     meta = _load_meta(resolved_upload_id)
     if meta.get("user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="未找到上传会话")
@@ -350,6 +420,7 @@ async def upload_chunk(
 ):
     _cleanup_expired_tmp_uploads()
 
+    upload_id = _validate_upload_id(upload_id)
     meta = _load_meta(upload_id)
     if meta.get("user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="upload_id 不存在")
@@ -394,6 +465,8 @@ async def complete_upload(
 ):
     _cleanup_expired_tmp_uploads()
 
+    upload_id = _validate_upload_id(upload_id)
+    safe_file_prefix = _build_safe_file_prefix(region_code, image_name)
     meta = _load_meta(upload_id)
     if meta.get("user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="upload_id 不存在")
@@ -401,6 +474,11 @@ async def complete_upload(
     # complete 幂等：重复调用直接返回上次结果
     if meta.get("status") == "completed" and meta.get("result"):
         return success_response(message="上传已完成", data=meta["result"])
+
+    required_meta_fields = ("total_chunks", "chunk_size", "file_size", "file_name")
+    missing_fields = [field for field in required_meta_fields if field not in meta]
+    if missing_fields:
+        raise HTTPException(status_code=422, detail=f"上传会话元数据缺失: {missing_fields}")
 
     lock_path = _session_dir(upload_id) / COMPLETE_LOCK_FILE
     try:
@@ -437,12 +515,12 @@ async def complete_upload(
         if merged_size != file_size:
             raise HTTPException(status_code=422, detail="分片总大小与文件大小不一致")
 
-        original_name = Path(str(meta.get("file_name", "merged.tif"))).name
+        original_name = _sanitize_upload_filename(str(meta.get("file_name", "merged.tif")))
         if not original_name.lower().endswith((".tif", ".tiff")):
             raise HTTPException(status_code=422, detail="最终文件必须是 .tif/.tiff")
 
-        tif_filename = f"{region_code}_{image_name}_{original_name}"
-        tif_path = IMAGE_DIR / tif_filename
+        tif_filename = f"{safe_file_prefix}_{original_name}"
+        tif_path = _safe_join(IMAGE_DIR, tif_filename)
         with tif_path.open("wb") as merged_file:
             for idx in required:
                 part_path = _chunks_dir(upload_id) / f"{idx}.part"
@@ -452,7 +530,11 @@ async def complete_upload(
         if tif_path.stat().st_size != file_size:
             raise HTTPException(status_code=422, detail="合并后文件大小校验失败")
 
-        bbox = get_tif_bbox_wgs84(tif_path)
+        try:
+            bbox = get_tif_bbox_wgs84(tif_path)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"TIF 文件解析失败: {str(exc)}")
+
         db_image = await _save_shp_and_create_records(
             db=db,
             user_id=current_user.id,
@@ -465,6 +547,7 @@ async def complete_upload(
             tif_path=tif_path,
             shp_files=shp_files,
             bbox=bbox,
+            safe_file_prefix=safe_file_prefix,
         )
         await db.commit()
 
@@ -541,6 +624,11 @@ async def complete_upload(
         if tif_path and tif_path.exists():
             tif_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"上传失败: {str(exc)}")
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 @router.post("/upload", summary="上传影像（整文件，兼容旧流程）")
@@ -563,9 +651,12 @@ async def upload_image(
         if not image_file.filename or not image_file.filename.lower().endswith((".tif", ".tiff")):
             raise ValueError("image_file 必须是 .tif 或 .tiff 文件")
 
+        safe_file_prefix = _build_safe_file_prefix(region_code, image_name)
+
         # ── 1. 保存 TIF ──────────────────────────────────────────────────
-        tif_filename = f"{region_code}_{image_name}_{Path(image_file.filename).name}"
-        tif_path = IMAGE_DIR / tif_filename        # E:\change_detection\...\images\xxx.tif
+        original_name = _sanitize_upload_filename(image_file.filename)
+        tif_filename = f"{safe_file_prefix}_{original_name}"
+        tif_path = _safe_join(IMAGE_DIR, tif_filename)        # E:\change_detection\...\images\xxx.tif
         with tif_path.open("wb") as buffer:
             _save_upload_stream(image_file.file, buffer)
 
@@ -584,6 +675,7 @@ async def upload_image(
             tif_path=tif_path,
             shp_files=shp_files,
             bbox=bbox,
+            safe_file_prefix=safe_file_prefix,
         )
         await db.commit()
 
@@ -715,7 +807,8 @@ def _safe_unlink(file_path: Optional[str]) -> None:
 
 def _save_upload_file(upload: UploadFile, target_dir: Path, filename: str) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
-    save_path = target_dir / filename
+    safe_name = _sanitize_upload_filename(filename)
+    save_path = _safe_join(target_dir, safe_name)
     with save_path.open("wb") as buffer:
         _save_upload_stream(upload.file, buffer)
     return save_path
@@ -786,13 +879,13 @@ async def edit_image(
 
         final_image_name = image_name if image_name is not None else image.image_name
         final_region_code = region_code if region_code is not None else image.region_code
-        file_prefix = f"{final_region_code}_{final_image_name}"
+        safe_file_prefix = _build_safe_file_prefix(final_region_code, final_image_name)
 
         if image_file is not None:
             if not image_file.filename or not image_file.filename.lower().endswith((".tif", ".tiff")):
                 raise HTTPException(status_code=422, detail="image_file 必须是 .tif 或 .tiff 文件")
 
-            tif_filename = f"{file_prefix}_{image.id}_{Path(image_file.filename).name}"
+            tif_filename = f"{safe_file_prefix}_{image.id}_{_sanitize_upload_filename(image_file.filename)}"
             tif_path = _save_upload_file(image_file, IMAGE_DIR, tif_filename)
             new_files.append(tif_path)
 
@@ -803,13 +896,13 @@ async def edit_image(
 
         shp_group = _extract_shp_group(shp_files, shp_file, dbf_file, prj_file)
         boundary_updates = {}
-        shp_dir = SHAPEFILE_DIR / file_prefix
+        shp_dir = _safe_join(SHAPEFILE_DIR, safe_file_prefix)
 
         if shp_group["shp"] is not None:
             shp_upload = shp_group["shp"]
             if not shp_upload.filename or not shp_upload.filename.lower().endswith(".shp"):
                 raise HTTPException(status_code=422, detail="shp_file 必须是 .shp 文件")
-            shp_path = _save_upload_file(shp_upload, shp_dir, Path(shp_upload.filename).name)
+            shp_path = _save_upload_file(shp_upload, shp_dir, shp_upload.filename)
             new_files.append(shp_path)
             boundary_updates["shp_path"] = str(shp_path)
 
@@ -817,7 +910,7 @@ async def edit_image(
             dbf_upload = shp_group["dbf"]
             if not dbf_upload.filename or not dbf_upload.filename.lower().endswith(".dbf"):
                 raise HTTPException(status_code=422, detail="dbf_file 必须是 .dbf 文件")
-            dbf_path = _save_upload_file(dbf_upload, shp_dir, Path(dbf_upload.filename).name)
+            dbf_path = _save_upload_file(dbf_upload, shp_dir, dbf_upload.filename)
             new_files.append(dbf_path)
             boundary_updates["dbf_path"] = str(dbf_path)
 
@@ -825,7 +918,7 @@ async def edit_image(
             prj_upload = shp_group["prj"]
             if not prj_upload.filename or not prj_upload.filename.lower().endswith(".prj"):
                 raise HTTPException(status_code=422, detail="prj_file 必须是 .prj 文件")
-            prj_path = _save_upload_file(prj_upload, shp_dir, Path(prj_upload.filename).name)
+            prj_path = _save_upload_file(prj_upload, shp_dir, prj_upload.filename)
             new_files.append(prj_path)
             boundary_updates["prj_path"] = str(prj_path)
 
@@ -837,7 +930,7 @@ async def edit_image(
             await crud_images.upsert_boundary_files(
                 db,
                 image,
-                file_prefix=file_prefix,
+                file_prefix=safe_file_prefix,
                 shp_path=boundary_updates.get("shp_path"),
                 dbf_path=boundary_updates.get("dbf_path"),
                 prj_path=boundary_updates.get("prj_path"),
