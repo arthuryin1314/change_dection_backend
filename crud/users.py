@@ -28,6 +28,9 @@ async def create_user(db:AsyncSession,user_data:UserRequest):
 
 
 async def create_token(db:AsyncSession,user_id:int):
+    """
+    当前登录态直接签发 JWT，并把 user.token_version 写入 token。
+    """
     query = select(User).where(User.id == user_id)
     result = await db.execute(query)
     user = result.scalar_one_or_none()
@@ -56,9 +59,9 @@ async def check_old_password(
     query = select(User).where(User.id == user_id)
     result = await db.execute(query)
     db_user = result.scalar_one_or_none()
-    if verify_password(old_password, db_user.password):
-        return True
-    return False
+    if db_user is None:
+        return None
+    return verify_password(old_password, db_user.password)
 
 async def update_password(
         db:AsyncSession,
@@ -75,6 +78,7 @@ async def update_password(
     return False
 
 async def clear_user_token(db:AsyncSession,user_id:int):
+    """通过递增 token_version 让该用户历史 JWT 全部失效。"""
     stmt = (
         update(User)
         .where(User.id == user_id)
