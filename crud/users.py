@@ -1,11 +1,9 @@
-import uuid
-from sqlalchemy import func
-from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
-from models.users import User, UserToken
+from models.users import User
 from sqlalchemy import select
 from schemas.users import UserRequest, UserUpdateRequest
 from utils.security import get_password_hash, verify_password
+from utils.jwt_utils import create_access_token
 from crud import images as crud_images
 
 
@@ -30,32 +28,13 @@ async def create_user(db:AsyncSession,user_data:UserRequest):
 
 
 async def createToken(db:AsyncSession,user_id:int):
-    token = str(uuid.uuid4())
-    query=select(UserToken).where(UserToken.user_id == user_id)
+    query = select(User).where(User.id == user_id)
     result = await db.execute(query)
-    existing_token = result.scalar_one_or_none()
-    if existing_token:
-        existing_token.token = token
-        existing_token.create_at = func.now()
-        existing_token.expire_at = func.now() + timedelta(days=1)
-        await db.flush()
-        return existing_token.token
-    user_token = UserToken(user_id=user_id, token=token)
-    db.add(user_token)
-    await db.flush()
-    return token
+    user = result.scalar_one_or_none()
+    if not user:
+        raise ValueError("用户不存在")
+    return create_access_token(user.id, user.token_version)
 
-
-async def get_user_by_token(db:AsyncSession,token:str):
-    query = select(UserToken).where(
-        UserToken.token == token,
-        UserToken.expire_at > func.now()
-    )
-    result = await db.execute(query)
-    db_user_token = result.scalar_one_or_none()
-    if db_user_token:
-        return db_user_token.user_id
-    return None
 
 async def update_user_info(db:AsyncSession,user_info:UserUpdateRequest,user_id:int):
     query = select(User).where(User.id == user_id)
@@ -96,23 +75,17 @@ async def update_password(
     return False
 
 async def clear_user_token(db:AsyncSession,user_id:int):
-    query = select(UserToken).where(UserToken.user_id == user_id)
+    query = select(User).where(User.id == user_id)
     result = await db.execute(query)
-    user_token = result.scalar_one_or_none()
-    if not user_token:
+    user = result.scalar_one_or_none()
+    if not user:
         return False
-    await db.delete(user_token)
+    user.token_version += 1
     await db.flush()
     return True
 
 async def delete_user(db:AsyncSession,user_id:int):
     deleted_images = await crud_images.delete_images_by_user_with_files(db, user_id)
-
-    query_token = select(UserToken).where(UserToken.user_id == user_id)
-    result = await db.execute(query_token)
-    user_token = result.scalar_one_or_none()
-    if user_token:
-        await db.delete(user_token)
 
     query_user = select(User).where(User.id == user_id)
     result = await db.execute(query_user)

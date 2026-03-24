@@ -1,16 +1,19 @@
 import httpx
 from pathlib import Path
-import logging
 import rasterio
 from rasterio.warp import transform_bounds
-logger = logging.getLogger(__name__)
+import os
+import xml.etree.ElementTree as ET
 
-# ── 配置（建议放到 .env） ──────────────────────────────────────────────────
-GEOSERVER_URL       = "http://localhost:8080/geoserver"
-GEOSERVER_USER      = "admin"
-GEOSERVER_PASSWORD  = "geoserver"
-GEOSERVER_WORKSPACE = "change-detection"
-# ─────────────────────────────────────────────────────────────────────────
+
+
+GEOSERVER_URL =os.environ.get('GEOSERVER_URL')
+GEOSERVER_USER =os.environ.get('GEOSERVER_USER')
+GEOSERVER_PASSWORD =os.environ.get('GEOSERVER_PASSWORD')
+GEOSERVER_WORKSPACE =os.environ.get('GEOSERVER_WORKSPACE')
+
+if not GEOSERVER_USER or not GEOSERVER_PASSWORD:
+    raise RuntimeError("GEOSERVER_USER 和 GEOSERVER_PASSWORD 必须通过环境变量设置！")
 
 _AUTH     = (GEOSERVER_USER, GEOSERVER_PASSWORD)
 _XML_HDR  = {"Content-Type": "application/xml"}
@@ -31,7 +34,6 @@ async def _ensure_workspace() -> None:
             headers=_XML_HDR,
         )
         r.raise_for_status()
-        logger.info(f"[GeoServer] workspace '{GEOSERVER_WORKSPACE}' 已创建")
 
 
 def _to_geoserver_path(tif_path: Path) -> str:
@@ -45,6 +47,26 @@ def _to_geoserver_path(tif_path: Path) -> str:
     return f"file:///{posix}"                # file:///E:/change_detection/.../xxx.tif
 
 
+def _build_coverage_store_xml(layer_name: str, workspace: str, file_url: str) -> str:
+    root = ET.Element("coverageStore")
+    ET.SubElement(root, "name").text = layer_name
+    ET.SubElement(root, "workspace").text = workspace
+    ET.SubElement(root, "enabled").text = "true"
+    ET.SubElement(root, "type").text = "GeoTIFF"
+    ET.SubElement(root, "url").text = file_url
+    return ET.tostring(root, encoding="unicode")
+
+
+def _build_coverage_xml(layer_name: str, native_name: str | None = None) -> str:
+    root = ET.Element("coverage")
+    ET.SubElement(root, "name").text = layer_name
+    ET.SubElement(root, "title").text = layer_name
+    ET.SubElement(root, "enabled").text = "true"
+    if native_name is not None:
+        ET.SubElement(root, "nativeName").text = native_name
+    return ET.tostring(root, encoding="unicode")
+
+
 async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
     """
     同机 Windows：让 GeoServer 直接读取本地 TIF 文件路径，发布为图层。
@@ -53,16 +75,13 @@ async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
     await _ensure_workspace()
 
     file_url = _to_geoserver_path(tif_path)
-    logger.info(f"[GeoServer] 发布路径: {file_url}")
 
     # ── Step 1：创建 CoverageStore ─────────────────────────────────────
-    store_xml = f"""<coverageStore>
-  <name>{layer_name}</name>
-  <workspace>{GEOSERVER_WORKSPACE}</workspace>
-  <enabled>true</enabled>
-  <type>GeoTIFF</type>
-  <url>{file_url}</url>
-</coverageStore>"""
+    store_xml = _build_coverage_store_xml(
+        layer_name=layer_name,
+        workspace=GEOSERVER_WORKSPACE,
+        file_url=file_url,
+    )
 
     resp = await _req(
         "POST",
@@ -71,7 +90,7 @@ async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
         headers=_XML_HDR,
     )
     if resp.status_code == 409:
-        logger.warning(f"[GeoServer] CoverageStore '{layer_name}' 已存在，跳过创建")
+        pass
     elif resp.status_code not in (200, 201):
         raise RuntimeError(f"创建 CoverageStore 失败 [{resp.status_code}]: {resp.text}")
 
@@ -79,12 +98,7 @@ async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
     # GeoTIFF 的原生 coverage 名通常来自文件名（不含扩展名），
     # 不能直接用业务图层名，否则可能报 coverageName not supported。
     native_name = tif_path.stem
-    coverage_xml = f"""<coverage>
-  <name>{layer_name}</name>
-  <title>{layer_name}</title>
-  <enabled>true</enabled>
-  <nativeName>{native_name}</nativeName>
-</coverage>"""
+    coverage_xml = _build_coverage_xml(layer_name=layer_name, native_name=native_name)
 
     resp = await _req(
         "POST",
@@ -94,15 +108,11 @@ async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
         headers=_XML_HDR,
     )
     if resp.status_code == 409:
-        logger.warning(f"[GeoServer] Coverage '{layer_name}' 已存在，跳过创建")
+        pass
     elif resp.status_code not in (200, 201):
         # 兼容部分 GeoServer 场景：不显式传 nativeName 再试一次
         if "not supported" in resp.text.lower() or resp.status_code == 500:
-            fallback_xml = f"""<coverage>
-  <name>{layer_name}</name>
-  <title>{layer_name}</title>
-  <enabled>true</enabled>
-</coverage>"""
+            fallback_xml = _build_coverage_xml(layer_name=layer_name)
             retry = await _req(
                 "POST",
                 f"{GEOSERVER_URL}/rest/workspaces/{GEOSERVER_WORKSPACE}"
@@ -111,10 +121,7 @@ async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
                 headers=_XML_HDR,
             )
             if retry.status_code in (200, 201, 409):
-                logger.warning(
-                    f"[GeoServer] Coverage 首次发布失败，已用兼容模式成功发布: "
-                    f"layer={layer_name}, native={native_name}"
-                )
+                pass
             else:
                 raise RuntimeError(
                     f"发布 Coverage 失败 [{retry.status_code}]: {retry.text}"
@@ -128,7 +135,6 @@ async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
         f"&layers={GEOSERVER_WORKSPACE}:{layer_name}"
         f"&format=image/png"
     )
-    logger.info(f"[GeoServer] 图层 '{GEOSERVER_WORKSPACE}:{layer_name}' 发布成功")
     return wms_url
 
 def get_tif_bbox_wgs84(tif_path: Path) -> list[float]:

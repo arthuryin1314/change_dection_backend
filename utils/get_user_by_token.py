@@ -5,8 +5,8 @@ from sqlalchemy import select
 from starlette import status
 
 from config.db_config import get_db
-from crud.users import get_user_by_token
 from models.users import User
+from utils.jwt_utils import verify_access_token
 
 
 async def get_current_user(
@@ -15,14 +15,16 @@ async def get_current_user(
 ):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token format")
-    token = authorization.split(' ')[1]
+    token = authorization.split(' ', 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token format")
 
-    user_id = await get_user_by_token(db, token)
-    if user_id is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token过期或无效")
-    query = select(User).where(User.id == user_id)
+    payload = verify_access_token(token)
+    query = select(User).where(User.id == payload["user_id"])
     result = await db.execute(query)
     user = result.scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户未被发现")
+    if user.token_version != payload["token_version"]:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token过期或无效")
     return user

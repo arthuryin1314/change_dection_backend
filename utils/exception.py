@@ -1,3 +1,4 @@
+import os
 import traceback
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -5,7 +6,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette import status
 # 开发模式：返回详细错误信息
 # ⽣产模式：返回简化错误信息
-DEBUG_MODE = True # 教学项⽬保持开启
+# DEBUG_MODE = True # 教学项⽬保持开启
+DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
 async def http_exception_handler(request: Request, exc: HTTPException):
  """
  处理 HTTPException 异常
@@ -24,6 +26,7 @@ async def integrity_error_handler(request: Request, exc: IntegrityError):
  处理数据库完整性约束错误
  """
  error_msg = str(exc.orig)
+ error_data = None
  # 判断具体的约束错误类型
  if "username_UNIQUE" in error_msg or "Duplicate entry" in error_msg:
     detail = "⽤户名已存在"
@@ -32,7 +35,6 @@ async def integrity_error_handler(request: Request, exc: IntegrityError):
  else:
     detail = "数据约束冲突，请检查输⼊"
     # 开发模式下返回详细错误信息
-    error_data = None
  if DEBUG_MODE:
     error_data = {
         "error_type": "IntegrityError",
@@ -85,9 +87,9 @@ async def general_exception_handler(request: Request, exc: Exception):
         }
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "code": 500,
-                "message": "服务器内部错误",
-                "data": error_data
-            }
+            content={"code": 500, "message": "服务器内部错误", "data": error_data},
         )
+    return JSONResponse(
+        status_code=500,
+        content={"code": 500, "message": "服务器内部错误", "data": None},
+    )

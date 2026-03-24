@@ -17,7 +17,6 @@ from utils.geoserver_utils import publish_geotiff_layer, get_tif_bbox_wgs84
 from utils.response import success_response
 from utils.date_parser import parse_capture_date
 from utils.get_user_by_token import get_current_user
-from utils.geoserver_utils import logger
 from utils.geoserver_utils import GEOSERVER_URL, GEOSERVER_WORKSPACE
 router = APIRouter(prefix="/api/images", tags=["images"])
 
@@ -485,7 +484,6 @@ async def complete_upload(
             except Exception as exc:
                 await db.rollback()
                 geoserver_error = str(exc)
-                logger.error(f"[GeoServer] 分片上传发布失败（数据已入库 id={db_image.id}）: {exc}")
 
         refreshed = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
         payload_image = refreshed or db_image
@@ -513,7 +511,6 @@ async def complete_upload(
         await db.rollback()
         # GeoServer 发布失败或其他提交后异常：主记录可能已入库，尽量返回降级成功结果
         if db_image is not None:
-            logger.error(f"[GeoServer] 发布失败（数据已入库 id={db_image.id}）: {exc}")
             payload_image = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
             payload_image = payload_image or db_image
             return success_response(
@@ -610,7 +607,6 @@ async def upload_image(
         await db.rollback()
         # GeoServer 发布失败或其他提交后异常：主记录可能已入库，尽量返回降级成功结果
         if db_image is not None:
-            logger.error(f"[GeoServer] 发布失败（数据已入库 id={db_image.id}）: {exc}")
             payload_image = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
             payload_image = payload_image or db_image
             return success_response(
