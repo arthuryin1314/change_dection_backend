@@ -1,6 +1,4 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi import HTTPException
-from starlette import status
 from models.users import User
 from sqlalchemy import select, update
 from schemas.users import UserRequest, UserUpdateRequest
@@ -62,7 +60,7 @@ async def check_old_password(
     result = await db.execute(query)
     db_user = result.scalar_one_or_none()
     if db_user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+        return None
     return verify_password(old_password, db_user.password)
 
 async def update_password(

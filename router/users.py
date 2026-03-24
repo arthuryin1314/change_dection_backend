@@ -80,10 +80,12 @@ async def update_password(
         db: AsyncSession = Depends(get_db),
         current_user = Depends(get_current_user)
 ):
-    is_old_password_right=await check_old_password(db,pass_form.oldPassword,current_user.id)
+    is_old_password_right = await check_old_password(db, pass_form.oldPassword, current_user.id)
+    if is_old_password_right is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     if not is_old_password_right:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="旧密码错误")
-    updated=await crud_update_password(db,pass_form.password,current_user.id)
+    updated = await crud_update_password(db, pass_form.password, current_user.id)
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     await clear_user_token(db,current_user.id)
