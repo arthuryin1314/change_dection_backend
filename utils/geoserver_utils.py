@@ -12,8 +12,19 @@ GEOSERVER_USER =os.environ.get('GEOSERVER_USER')
 GEOSERVER_PASSWORD =os.environ.get('GEOSERVER_PASSWORD')
 GEOSERVER_WORKSPACE =os.environ.get('GEOSERVER_WORKSPACE')
 
-if not GEOSERVER_USER or not GEOSERVER_PASSWORD:
-    raise RuntimeError("GEOSERVER_USER 和 GEOSERVER_PASSWORD 必须通过环境变量设置！")
+# 统一校验所有必填环境变量
+_required_env_vars = {
+    "GEOSERVER_URL": GEOSERVER_URL,
+    "GEOSERVER_USER": GEOSERVER_USER,
+    "GEOSERVER_PASSWORD": GEOSERVER_PASSWORD,
+    "GEOSERVER_WORKSPACE": GEOSERVER_WORKSPACE,
+}
+missing_env_vars = [name for name, value in _required_env_vars.items() if not value]
+if missing_env_vars:
+    raise RuntimeError(
+        "以下 GeoServer 环境变量必须通过环境变量设置且不能为空: "
+        + ", ".join(missing_env_vars)
+    )
 
 _AUTH     = (GEOSERVER_USER, GEOSERVER_PASSWORD)
 _XML_HDR  = {"Content-Type": "application/xml"}

@@ -6,7 +6,7 @@ from starlette import status
 
 from schemas.users import UserRequest, UserLoginRequest, UserUpdateRequest, UserUpdatePassword
 from config.db_config import get_db
-from crud.users import get_user_by_username,create_user, createToken,get_user_by_telNum, update_user_info as crud_update_user_info, \
+from crud.users import get_user_by_username,create_user, create_token,get_user_by_telNum, update_user_info as crud_update_user_info, \
     check_old_password, clear_user_token, update_password as crud_update_password, delete_user as crud_delete_user
 from utils.get_user_by_token import get_current_user
 from utils.response import success_response
@@ -21,7 +21,7 @@ async def register_user(user_data: UserRequest, db: AsyncSession = Depends(get_d
     if existing_user:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户已经存在")
     user = await create_user(db,user_data)
-    token = await createToken(db,user.id)
+    token = await create_token(db,user.id)
     await db.commit()
     return success_response(message='注册成功', data={
         'token':token,
@@ -41,7 +41,7 @@ async def login_user(form_data:UserLoginRequest, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户不存在")
     if not verify_password(form_data.password, db_user.password):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="密码错误")
-    token = await createToken(db, db_user.id)
+    token = await create_token(db, db_user.id)
     await db.commit()
     return success_response(message='登录成功', data={
         'token': token

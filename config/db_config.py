@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 
 database_url=os.environ.get('DATABASE_URL')
 if not database_url:
-    raise RuntimeError("database_url environment variable is required")
+    raise RuntimeError("DATABASE_URL environment variable is required")
 async_engine = create_async_engine(
     database_url,
     # echo=True,

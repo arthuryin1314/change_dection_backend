@@ -1,26 +1,34 @@
 import base64
+import binascii
 import hashlib
 import hmac
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from fastapi import HTTPException, status
 
-load_dotenv()
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-if not SECRET_KEY or len(SECRET_KEY) < 32:
-    raise RuntimeError("JWT_SECRET_KEY must be at least 32 characters")
+@lru_cache(maxsize=1)
+def _get_jwt_settings() -> tuple[str, str, int]:
+    # Lazy-load env vars on first token operation, not at import time.
+    load_dotenv()
 
-ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-if ALGORITHM != "HS256":
-    raise RuntimeError("Only HS256 is supported")
+    secret_key = os.getenv("JWT_SECRET_KEY")
+    if not secret_key or len(secret_key) < 32:
+        raise RuntimeError("JWT_SECRET_KEY must be at least 32 characters")
 
-ACCESS_TOKEN_EXPIRE_HOURS = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_HOURS", "24"))
-if ACCESS_TOKEN_EXPIRE_HOURS <= 0:
-    raise RuntimeError("JWT_ACCESS_TOKEN_EXPIRE_HOURS must be greater than 0")
+    algorithm = os.getenv("JWT_ALGORITHM", "HS256")
+    if algorithm != "HS256":
+        raise RuntimeError("Only HS256 is supported")
+
+    expire_hours = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_HOURS", "24"))
+    if expire_hours <= 0:
+        raise RuntimeError("JWT_ACCESS_TOKEN_EXPIRE_HOURS must be greater than 0")
+
+    return secret_key, algorithm, expire_hours
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -36,14 +44,15 @@ def _unauthorized() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired token",
-        headers={"WWW-Authenticate": "Bearer"},
     )
 
 
 def create_access_token(user_id: int, token_version: int = 0) -> str:
+    secret_key, algorithm, expire_hours = _get_jwt_settings()
+
     now = datetime.now(timezone.utc)
-    expire = now + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
-    header = {"alg": ALGORITHM, "typ": "JWT"}
+    expire = now + timedelta(hours=expire_hours)
+    header = {"alg": algorithm, "typ": "JWT"}
     payload = {
         "sub": str(user_id),
         "ver": int(token_version),
@@ -53,16 +62,18 @@ def create_access_token(user_id: int, token_version: int = 0) -> str:
     header_part = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     payload_part = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signing_input = f"{header_part}.{payload_part}".encode("ascii")
-    signature = hmac.new(SECRET_KEY.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    signature = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
     return f"{header_part}.{payload_part}.{_b64url_encode(signature)}"
 
 
 def verify_access_token(token: str) -> dict[str, int]:
+    secret_key, algorithm, _ = _get_jwt_settings()
+
     try:
         header_part, payload_part, signature_part = token.split(".")
         signing_input = f"{header_part}.{payload_part}".encode("ascii")
         expected_signature = hmac.new(
-            SECRET_KEY.encode("utf-8"),
+            secret_key.encode("utf-8"),
             signing_input,
             hashlib.sha256,
         ).digest()
@@ -71,7 +82,7 @@ def verify_access_token(token: str) -> dict[str, int]:
             raise _unauthorized()
 
         header = json.loads(_b64url_decode(header_part).decode("utf-8"))
-        if header.get("alg") != ALGORITHM or header.get("typ") != "JWT":
+        if header.get("alg") != algorithm or header.get("typ") != "JWT":
             raise _unauthorized()
 
         payload = json.loads(_b64url_decode(payload_part).decode("utf-8"))
@@ -84,5 +95,5 @@ def verify_access_token(token: str) -> dict[str, int]:
         }
     except HTTPException:
         raise
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError, base64.binascii.Error):
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, binascii.Error):
         raise _unauthorized()

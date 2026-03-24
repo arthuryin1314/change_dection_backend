@@ -1,6 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
+import logging
 import shutil
 from pathlib import Path
 import json
@@ -18,6 +19,7 @@ from utils.response import success_response
 from utils.date_parser import parse_capture_date
 from utils.get_user_by_token import get_current_user
 from utils.geoserver_utils import GEOSERVER_URL, GEOSERVER_WORKSPACE
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/images", tags=["images"])
 
 # 配置上传目录
@@ -484,6 +486,13 @@ async def complete_upload(
             except Exception as exc:
                 await db.rollback()
                 geoserver_error = str(exc)
+                logger.exception(
+                    "GeoServer publish failed in chunk complete: upload_id=%s image_id=%s layer_name=%s user_id=%s",
+                    upload_id,
+                    getattr(db_image, "id", None),
+                    layer_name,
+                    getattr(current_user, "id", None),
+                )
 
         refreshed = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
         payload_image = refreshed or db_image
@@ -511,6 +520,13 @@ async def complete_upload(
         await db.rollback()
         # GeoServer 发布失败或其他提交后异常：主记录可能已入库，尽量返回降级成功结果
         if db_image is not None:
+            logger.exception(
+                "Upload complete fallback triggered: upload_id=%s image_id=%s layer_name=%s user_id=%s",
+                upload_id,
+                getattr(db_image, "id", None),
+                _build_layer_name(region_code, image_name, getattr(db_image, "id", None)),
+                getattr(current_user, "id", None),
+            )
             payload_image = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
             payload_image = payload_image or db_image
             return success_response(
@@ -607,6 +623,12 @@ async def upload_image(
         await db.rollback()
         # GeoServer 发布失败或其他提交后异常：主记录可能已入库，尽量返回降级成功结果
         if db_image is not None:
+            logger.exception(
+                "Upload fallback triggered: image_id=%s layer_name=%s user_id=%s",
+                getattr(db_image, "id", None),
+                _build_layer_name(region_code, image_name, getattr(db_image, "id", None)),
+                getattr(current_user, "id", None),
+            )
             payload_image = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
             payload_image = payload_image or db_image
             return success_response(

@@ -27,7 +27,7 @@ async def create_user(db:AsyncSession,user_data:UserRequest):
     return user
 
 
-async def createToken(db:AsyncSession,user_id:int):
+async def create_token(db:AsyncSession,user_id:int):
     query = select(User).where(User.id == user_id)
     result = await db.execute(query)
     user = result.scalar_one_or_none()
