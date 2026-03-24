@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from models.users import User
-from sqlalchemy import select
+from sqlalchemy import select, update
 from schemas.users import UserRequest, UserUpdateRequest
 from utils.security import get_password_hash, verify_password
 from utils.jwt_utils import create_access_token
@@ -75,14 +75,14 @@ async def update_password(
     return False
 
 async def clear_user_token(db:AsyncSession,user_id:int):
-    query = select(User).where(User.id == user_id)
-    result = await db.execute(query)
-    user = result.scalar_one_or_none()
-    if not user:
-        return False
-    user.token_version += 1
-    await db.flush()
-    return True
+    stmt = (
+        update(User)
+        .where(User.id == user_id)
+        .values(token_version=User.token_version + 1)
+        .returning(User.id)
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none() is not None
 
 async def delete_user(db:AsyncSession,user_id:int):
     deleted_images = await crud_images.delete_images_by_user_with_files(db, user_id)
