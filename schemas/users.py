@@ -19,6 +19,12 @@ def _strip_required(value, field_name: str) -> str:
     return result
 
 
+def _required_no_strip(value, field_name: str) -> str:
+    if not isinstance(value, str) or value == "":
+        raise ValueError(f"{field_name}不能为空")
+    return value
+
+
 class UserRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=50, description="用户名")
     telNum: str = Field(..., min_length=11, max_length=11, description="电话号码")
@@ -40,7 +46,7 @@ class UserRequest(BaseModel):
     @field_validator("password", mode="before")
     @classmethod
     def validate_password(cls, value) -> str:
-        value = _strip_required(value, "密码")
+        value = _required_no_strip(value, "密码")
         return _validate_password_mixed(value)
 
 
@@ -59,7 +65,7 @@ class UserLoginRequest(BaseModel):
     @field_validator("password", mode="before")
     @classmethod
     def validate_password(cls, value) -> str:
-        return _strip_required(value, "密码")
+        return _required_no_strip(value, "密码")
 
 
 class UserUpdateRequest(BaseModel):
@@ -87,12 +93,12 @@ class UserUpdatePassword(BaseModel):
     @field_validator("oldPassword", mode="before")
     @classmethod
     def validate_old_password(cls, value) -> str:
-        return _strip_required(value, "旧密码")
+        return _required_no_strip(value, "旧密码")
 
     @field_validator("password", mode="before")
     @classmethod
     def validate_new_password(cls, value) -> str:
-        value = _strip_required(value, "新密码")
+        value = _required_no_strip(value, "新密码")
         return _validate_password_mixed(value)
 
     @model_validator(mode="after")
