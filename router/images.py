@@ -183,6 +183,11 @@ def _cleanup_expired_tmp_uploads() -> None:
         if not upload_dir.is_dir():
             continue
 
+        lock_file = upload_dir / COMPLETE_LOCK_FILE
+        # Skip sessions currently being merged.
+        if lock_file.exists():
+            continue
+
         meta_file = upload_dir / SESSION_META_FILE
         expire_base = meta_file if meta_file.exists() else upload_dir
         age = now_ts - expire_base.stat().st_mtime
@@ -199,6 +204,9 @@ def _cleanup_expired_tmp_uploads() -> None:
             except Exception:
                 pass
 
+        # Double-check lock right before deletion to reduce race window.
+        if lock_file.exists():
+            continue
         shutil.rmtree(upload_dir, ignore_errors=True)
 
 
@@ -519,25 +527,28 @@ async def complete_upload(
 
     upload_id = _validate_upload_id(upload_id)
     safe_file_prefix = _build_safe_file_prefix(region_code, image_name)
-    meta = _load_meta(upload_id)
-    if meta.get("user_id") != current_user.id:
-        raise HTTPException(status_code=404, detail="upload_id 不存在")
-
-    # complete 幂等：重复调用直接返回上次结果
-    if meta.get("status") == "completed" and meta.get("result"):
-        return success_response(message="上传已完成", data=meta["result"])
-
-    required_meta_fields = ("total_chunks", "chunk_size", "file_size", "file_name")
-    missing_fields = [field for field in required_meta_fields if field not in meta]
-    if missing_fields:
-        raise HTTPException(status_code=422, detail=f"上传会话元数据缺失: {missing_fields}")
-
     lock_path = _session_dir(upload_id) / COMPLETE_LOCK_FILE
 
     tif_path: Optional[Path] = None
     db_image = None
     try:
         with _exclusive_file_lock(lock_path):
+            meta = _load_meta(upload_id)
+            if meta.get("user_id") != current_user.id:
+                raise HTTPException(status_code=404, detail="upload_id 不存在")
+
+            # complete 幂等：重复调用直接返回上次结果
+            if meta.get("status") == "completed" and meta.get("result"):
+                return success_response(message="上传已完成", data=meta["result"])
+
+            required_meta_fields = ("total_chunks", "chunk_size", "file_size", "file_name")
+            missing_fields = [field for field in required_meta_fields if field not in meta]
+            if missing_fields:
+                raise HTTPException(status_code=422, detail=f"上传会话元数据缺失: {missing_fields}")
+
+            # Refresh session mtime at merge start.
+            _save_meta(upload_id, meta)
+
             total_chunks = int(meta["total_chunks"])
             chunk_size = int(meta["chunk_size"])
             file_size = int(meta["file_size"])

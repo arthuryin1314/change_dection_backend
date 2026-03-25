@@ -54,6 +54,33 @@ def _format_validation_message(exc: RequestValidationError) -> str:
     return f"{field}: {msg}"
 
 
+def _get_orig_sqlstate(orig) -> str | None:
+    sqlstate = getattr(orig, "sqlstate", None)
+    if sqlstate:
+        return str(sqlstate)
+
+    pgcode = getattr(orig, "pgcode", None)
+    if pgcode:
+        return str(pgcode)
+
+    return None
+
+
+def _get_orig_constraint_name(orig) -> str | None:
+    # asyncpg style
+    constraint_name = getattr(orig, "constraint_name", None)
+    if constraint_name:
+        return str(constraint_name)
+
+    # psycopg2 style
+    diag = getattr(orig, "diag", None)
+    diag_constraint = getattr(diag, "constraint_name", None) if diag else None
+    if diag_constraint:
+        return str(diag_constraint)
+
+    return None
+
+
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
     message = _format_validation_message(exc)
     if DEBUG_MODE:
@@ -66,17 +93,41 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 async def integrity_error_handler(request: Request, exc: IntegrityError):
-    error_msg = str(exc.orig)
-    if "username_UNIQUE" in error_msg or "Duplicate entry" in error_msg:
-        detail = "用户名已存在"
-    elif "FOREIGN KEY" in error_msg:
+    orig = exc.orig
+    error_msg = str(orig)
+    sqlstate = _get_orig_sqlstate(orig)
+    constraint_name = (_get_orig_constraint_name(orig) or "").lower()
+
+    detail = "数据约束冲突，请检查输入"
+    status_code = status.HTTP_400_BAD_REQUEST
+
+    # PostgreSQL unique_violation
+    if sqlstate == "23505":
+        status_code = status.HTTP_409_CONFLICT
+        if "username" in constraint_name:
+            detail = "用户名已存在"
+        elif "phone" in constraint_name:
+            detail = "手机号已存在"
+        else:
+            detail = "用户名或手机号已被注册"
+    # PostgreSQL foreign_key_violation
+    elif sqlstate == "23503":
         detail = "关联数据不存在"
     else:
-        detail = "数据约束冲突，请检查输入"
+        # Fallback for non-PostgreSQL drivers/messages.
+        lower_msg = error_msg.lower()
+        if "duplicate entry" in lower_msg or "unique" in lower_msg:
+            status_code = status.HTTP_409_CONFLICT
+            detail = "用户名或手机号已被注册"
+        elif "foreign key" in lower_msg:
+            detail = "关联数据不存在"
 
     if DEBUG_MODE:
-        print(f"[IntegrityError] path={request.url} detail={error_msg}")
-    return error_response(status.HTTP_400_BAD_REQUEST, detail)
+        print(
+            f"[IntegrityError] path={request.url} sqlstate={sqlstate} "
+            f"constraint={constraint_name or '-'} detail={error_msg}"
+        )
+    return error_response(status_code, detail)
 
 
 async def sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError):

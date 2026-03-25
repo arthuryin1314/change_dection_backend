@@ -22,5 +22,6 @@ def error_response(code: int, message: str) -> JSONResponse:
         content={
             "code": code,
             "message": message,
+            "data": None,
         },
     )

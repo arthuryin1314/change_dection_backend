@@ -10,7 +10,9 @@ def _validate_password_mixed(value: str) -> str:
     return value
 
 
-def _strip_required(value: str, field_name: str) -> str:
+def _strip_required(value, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name}不能为空")
     result = value.strip()
     if not result:
         raise ValueError(f"{field_name}不能为空")
@@ -22,22 +24,22 @@ class UserRequest(BaseModel):
     telNum: str = Field(..., min_length=11, max_length=11, description="电话号码")
     password: str = Field(..., min_length=6, max_length=128, description="密码")
 
-    @field_validator("name")
+    @field_validator("name", mode="before")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def validate_name(cls, value) -> str:
         return _strip_required(value, "用户名")
 
-    @field_validator("telNum")
+    @field_validator("telNum", mode="before")
     @classmethod
-    def validate_tel_num(cls, value: str) -> str:
+    def validate_tel_num(cls, value) -> str:
         value = _strip_required(value, "电话号码")
         if not _MOBILE_RE.fullmatch(value):
             raise ValueError("手机号格式不正确")
         return value
 
-    @field_validator("password")
+    @field_validator("password", mode="before")
     @classmethod
-    def validate_password(cls, value: str) -> str:
+    def validate_password(cls, value) -> str:
         value = _strip_required(value, "密码")
         return _validate_password_mixed(value)
 
@@ -46,17 +48,17 @@ class UserLoginRequest(BaseModel):
     telNum: str = Field(..., min_length=11, max_length=11, description="电话号码")
     password: str = Field(..., min_length=1, max_length=128, description="密码")
 
-    @field_validator("telNum")
+    @field_validator("telNum", mode="before")
     @classmethod
-    def validate_tel_num(cls, value: str) -> str:
+    def validate_tel_num(cls, value) -> str:
         value = _strip_required(value, "电话号码")
         if not _MOBILE_RE.fullmatch(value):
             raise ValueError("手机号格式不正确")
         return value
 
-    @field_validator("password")
+    @field_validator("password", mode="before")
     @classmethod
-    def validate_password(cls, value: str) -> str:
+    def validate_password(cls, value) -> str:
         return _strip_required(value, "密码")
 
 
@@ -64,14 +66,14 @@ class UserUpdateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=50, description="用户名")
     telNum: str = Field(..., min_length=11, max_length=11, description="电话号码")
 
-    @field_validator("name")
+    @field_validator("name", mode="before")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def validate_name(cls, value) -> str:
         return _strip_required(value, "用户名")
 
-    @field_validator("telNum")
+    @field_validator("telNum", mode="before")
     @classmethod
-    def validate_tel_num(cls, value: str) -> str:
+    def validate_tel_num(cls, value) -> str:
         value = _strip_required(value, "电话号码")
         if not _MOBILE_RE.fullmatch(value):
             raise ValueError("手机号格式不正确")
@@ -82,14 +84,14 @@ class UserUpdatePassword(BaseModel):
     oldPassword: str = Field(..., min_length=1, max_length=128, description="旧密码")
     password: str = Field(..., min_length=6, max_length=128, description="新密码")
 
-    @field_validator("oldPassword")
+    @field_validator("oldPassword", mode="before")
     @classmethod
-    def validate_old_password(cls, value: str) -> str:
+    def validate_old_password(cls, value) -> str:
         return _strip_required(value, "旧密码")
 
-    @field_validator("password")
+    @field_validator("password", mode="before")
     @classmethod
-    def validate_new_password(cls, value: str) -> str:
+    def validate_new_password(cls, value) -> str:
         value = _strip_required(value, "新密码")
         return _validate_password_mixed(value)
 
