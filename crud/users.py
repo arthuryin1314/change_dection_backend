@@ -89,13 +89,13 @@ async def clear_user_token(db:AsyncSession,user_id:int):
     return result.scalar_one_or_none() is not None
 
 async def delete_user(db:AsyncSession,user_id:int):
-    deleted_images = await crud_images.delete_images_by_user_with_files(db, user_id)
-
     query_user = select(User).where(User.id == user_id)
     result = await db.execute(query_user)
     db_user = result.scalar_one_or_none()
     if not db_user:
         return None
+
+    deleted_images = await crud_images.delete_images_by_user_with_files(db, user_id)
 
     await db.delete(db_user)
     await db.flush()

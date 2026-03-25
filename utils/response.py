@@ -14,3 +14,14 @@ def success_response(message: str = "success", data: Any = None) -> JSONResponse
         },
     )
 
+
+def error_response(code: int, message: str) -> JSONResponse:
+    """Return a unified error payload with only code and message."""
+    return JSONResponse(
+        status_code=code,
+        content={
+            "code": code,
+            "message": message,
+            "data": None,
+        },
+    )
