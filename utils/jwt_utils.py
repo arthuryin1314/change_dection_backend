@@ -47,10 +47,16 @@ def _unauthorized() -> HTTPException:
     )
 
 
+def _utc_now() -> datetime:
+    """Return timezone-aware UTC datetime for JWT time claims."""
+    return datetime.now(timezone.utc)
+
+
 def create_access_token(user_id: int, token_version: int = 0) -> str:
     secret_key, algorithm, expire_hours = _get_jwt_settings()
 
-    now = datetime.now(timezone.utc)
+    # Expiration is configured by JWT_ACCESS_TOKEN_EXPIRE_HOURS (default: 24 hours).
+    now = _utc_now()
     expire = now + timedelta(hours=expire_hours)
     header = {"alg": algorithm, "typ": "JWT"}
     payload = {
@@ -86,7 +92,7 @@ def verify_access_token(token: str) -> dict[str, int]:
             raise _unauthorized()
 
         payload = json.loads(_b64url_decode(payload_part).decode("utf-8"))
-        if int(payload["exp"]) <= int(datetime.now(timezone.utc).timestamp()):
+        if int(payload["exp"]) <= int(_utc_now().timestamp()):
             raise _unauthorized()
 
         return {

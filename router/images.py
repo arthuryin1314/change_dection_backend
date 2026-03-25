@@ -1,10 +1,12 @@
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
+import asyncio
 import logging
 import re
 import shutil
 from pathlib import Path
+from contextlib import contextmanager
 import json
 import os
 import time
@@ -40,9 +42,41 @@ SESSION_META_FILE = "session.json"
 CHUNKS_DIR_NAME = "chunks"
 COMPLETE_LOCK_FILE = ".complete.lock"
 UPLOAD_TTL_SECONDS = 24 * 60 * 60
+TMP_CLEANUP_INTERVAL_SECONDS = 60 * 60
 
 
 _UPLOAD_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_tmp_cleanup_task: Optional[asyncio.Task] = None
+
+
+async def _run_tmp_cleanup_once() -> None:
+    # Run sync filesystem cleanup in a worker thread to avoid blocking event loop.
+    await asyncio.to_thread(_cleanup_expired_tmp_uploads)
+
+
+async def _periodic_tmp_cleanup() -> None:
+    while True:
+        await _run_tmp_cleanup_once()
+        await asyncio.sleep(TMP_CLEANUP_INTERVAL_SECONDS)
+
+
+def start_tmp_cleanup_task() -> None:
+    global _tmp_cleanup_task
+    if _tmp_cleanup_task is None or _tmp_cleanup_task.done():
+        _tmp_cleanup_task = asyncio.create_task(_periodic_tmp_cleanup())
+
+
+async def stop_tmp_cleanup_task() -> None:
+    global _tmp_cleanup_task
+    task = _tmp_cleanup_task
+    _tmp_cleanup_task = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def _validate_upload_id(upload_id: str) -> str:
@@ -124,8 +158,9 @@ def _load_meta(upload_id: str) -> dict:
         raise HTTPException(status_code=404, detail="upload_id 不存在")
     try:
         return json.loads(meta_file.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取上传会话失败: {str(exc)}")
+    except (json.JSONDecodeError, OSError):
+        logger.exception("Failed to load upload session metadata: upload_id=%s", upload_id)
+        raise HTTPException(status_code=500, detail="读取上传会话失败，请重新初始化上传")
 
 
 def _list_uploaded_chunks(upload_id: str) -> List[int]:
@@ -201,6 +236,30 @@ def _save_upload_stream(src, dst, chunk_size: int = 1024 * 1024) -> None:
         if not chunk:
             break
         dst.write(chunk)
+
+
+@contextmanager
+def _exclusive_file_lock(lock_path: Path):
+    fd = None
+    locked = False
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        locked = True
+        yield
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="该上传正在合并，请稍后重试")
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        # Only remove lock file if this request created it.
+        if locked:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 async def _save_shp_and_create_records(
@@ -349,8 +408,6 @@ def _serialize_image(image) -> dict:
 
 @router.post("/upload/init", summary="初始化分片上传")
 async def init_upload(payload: UploadInitRequest, current_user=Depends(get_current_user)):
-    _cleanup_expired_tmp_uploads()
-
     if payload.file_size <= 0 or payload.chunk_size <= 0 or payload.total_chunks <= 0:
         raise HTTPException(status_code=422, detail="file_size/chunk_size/total_chunks 必须大于 0")
 
@@ -383,8 +440,6 @@ async def get_upload_status(
     file_hash: Optional[str] = Query(None),
     current_user=Depends(get_current_user),
 ):
-    _cleanup_expired_tmp_uploads()
-
     resolved_upload_id = upload_id
     if not resolved_upload_id and file_hash:
         resolved_upload_id = _find_upload_id_by_hash(file_hash, current_user.id)
@@ -418,8 +473,6 @@ async def upload_chunk(
     chunk_file: Optional[UploadFile] = File(None, alias="chunk_file"),
     current_user=Depends(get_current_user),
 ):
-    _cleanup_expired_tmp_uploads()
-
     upload_id = _validate_upload_id(upload_id)
     meta = _load_meta(upload_id)
     if meta.get("user_id") != current_user.id:
@@ -463,7 +516,6 @@ async def complete_upload(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _cleanup_expired_tmp_uploads()
 
     upload_id = _validate_upload_id(upload_id)
     safe_file_prefix = _build_safe_file_prefix(region_code, image_name)
@@ -481,117 +533,113 @@ async def complete_upload(
         raise HTTPException(status_code=422, detail=f"上传会话元数据缺失: {missing_fields}")
 
     lock_path = _session_dir(upload_id) / COMPLETE_LOCK_FILE
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-    except FileExistsError:
-        raise HTTPException(status_code=409, detail="该上传正在合并，请稍后重试")
 
     tif_path: Optional[Path] = None
     db_image = None
     try:
-        total_chunks = int(meta["total_chunks"])
-        chunk_size = int(meta["chunk_size"])
-        file_size = int(meta["file_size"])
+        with _exclusive_file_lock(lock_path):
+            total_chunks = int(meta["total_chunks"])
+            chunk_size = int(meta["chunk_size"])
+            file_size = int(meta["file_size"])
 
-        uploaded = _list_uploaded_chunks(upload_id)
-        required = list(range(total_chunks))
-        if uploaded != required:
-            missing = sorted(set(required) - set(uploaded))
-            raise HTTPException(status_code=422, detail=f"分片不完整，缺失: {missing[:20]}")
+            uploaded = _list_uploaded_chunks(upload_id)
+            required = list(range(total_chunks))
+            if uploaded != required:
+                missing = sorted(set(required) - set(uploaded))
+                raise HTTPException(status_code=422, detail=f"分片不完整，缺失: {missing[:20]}")
 
-        merged_size = 0
-        for idx in required:
-            part_path = _chunks_dir(upload_id) / f"{idx}.part"
-            part_size = part_path.stat().st_size
-
-            if idx < total_chunks - 1 and part_size != chunk_size:
-                raise HTTPException(status_code=422, detail=f"分片 {idx} 大小不正确")
-            if idx == total_chunks - 1 and not (0 < part_size <= chunk_size):
-                raise HTTPException(status_code=422, detail="最后一片大小不正确")
-
-            merged_size += part_size
-
-        if merged_size != file_size:
-            raise HTTPException(status_code=422, detail="分片总大小与文件大小不一致")
-
-        original_name = _sanitize_upload_filename(str(meta.get("file_name", "merged.tif")))
-        if not original_name.lower().endswith((".tif", ".tiff")):
-            raise HTTPException(status_code=422, detail="最终文件必须是 .tif/.tiff")
-
-        tif_filename = f"{safe_file_prefix}_{original_name}"
-        tif_path = _safe_join(IMAGE_DIR, tif_filename)
-        with tif_path.open("wb") as merged_file:
+            merged_size = 0
             for idx in required:
                 part_path = _chunks_dir(upload_id) / f"{idx}.part"
-                with part_path.open("rb") as part_file:
-                    _save_upload_stream(part_file, merged_file)
+                part_size = part_path.stat().st_size
 
-        if tif_path.stat().st_size != file_size:
-            raise HTTPException(status_code=422, detail="合并后文件大小校验失败")
+                if idx < total_chunks - 1 and part_size != chunk_size:
+                    raise HTTPException(status_code=422, detail=f"分片 {idx} 大小不正确")
+                if idx == total_chunks - 1 and not (0 < part_size <= chunk_size):
+                    raise HTTPException(status_code=422, detail="最后一片大小不正确")
 
-        try:
-            bbox = get_tif_bbox_wgs84(tif_path)
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"TIF 文件解析失败: {str(exc)}")
+                merged_size += part_size
 
-        db_image = await _save_shp_and_create_records(
-            db=db,
-            user_id=current_user.id,
-            image_name=image_name,
-            resolution=resolution,
-            capture_date=capture_date,
-            satellite=satellite,
-            image_type=image_type,
-            region_code=region_code,
-            tif_path=tif_path,
-            shp_files=shp_files,
-            bbox=bbox,
-            safe_file_prefix=safe_file_prefix,
-        )
-        await db.commit()
+            if merged_size != file_size:
+                raise HTTPException(status_code=422, detail="分片总大小与文件大小不一致")
 
-        layer_name = _build_layer_name(region_code, image_name, db_image.id)
-        wms_url = None
-        published = False
-        geoserver_error = None
+            original_name = _sanitize_upload_filename(str(meta.get("file_name", "merged.tif")))
+            if not original_name.lower().endswith((".tif", ".tiff")):
+                raise HTTPException(status_code=422, detail="最终文件必须是 .tif/.tiff")
 
-        if layer_name and tif_path is not None:
+            tif_filename = f"{safe_file_prefix}_{original_name}"
+            tif_path = _safe_join(IMAGE_DIR, tif_filename)
+            with tif_path.open("wb") as merged_file:
+                for idx in required:
+                    part_path = _chunks_dir(upload_id) / f"{idx}.part"
+                    with part_path.open("rb") as part_file:
+                        _save_upload_stream(part_file, merged_file)
+
+            if tif_path.stat().st_size != file_size:
+                raise HTTPException(status_code=422, detail="合并后文件大小校验失败")
+
             try:
-                wms_url = await publish_geotiff_layer(tif_path=tif_path, layer_name=layer_name)
-                await crud_images.update_image_fields(
-                    db,
-                    db_image,
-                    {"layer_name": layer_name, "wms_url": wms_url},
-                )
-                await db.commit()
-                published = True
+                bbox = get_tif_bbox_wgs84(tif_path)
             except Exception as exc:
-                await db.rollback()
-                geoserver_error = str(exc)
-                logger.exception(
-                    "GeoServer publish failed in chunk complete: upload_id=%s image_id=%s layer_name=%s user_id=%s",
-                    upload_id,
-                    getattr(db_image, "id", None),
-                    layer_name,
-                    getattr(current_user, "id", None),
-                )
+                raise HTTPException(status_code=422, detail=f"TIF 文件解析失败: {str(exc)}")
 
-        refreshed = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
-        payload_image = refreshed or db_image
-        result = {
-            **_serialize_image_json(payload_image),
-            "upload_id": upload_id,
-            "published": published,
-        }
-        if geoserver_error:
-            result["geoserver_error"] = geoserver_error
-        meta["status"] = "completed"
-        meta["result"] = result
-        _save_meta(upload_id, meta)
+            db_image = await _save_shp_and_create_records(
+                db=db,
+                user_id=current_user.id,
+                image_name=image_name,
+                resolution=resolution,
+                capture_date=capture_date,
+                satellite=satellite,
+                image_type=image_type,
+                region_code=region_code,
+                tif_path=tif_path,
+                shp_files=shp_files,
+                bbox=bbox,
+                safe_file_prefix=safe_file_prefix,
+            )
+            await db.commit()
 
-        msg = "影像上传成功" if published else "影像已入库，GeoServer 图层发布失败，请稍后手动发布"
-        return success_response(message=msg, data=result)
+            layer_name = _build_layer_name(region_code, image_name, db_image.id)
+            wms_url = None
+            published = False
+            geoserver_error = None
+
+            if layer_name and tif_path is not None:
+                try:
+                    wms_url = await publish_geotiff_layer(tif_path=tif_path, layer_name=layer_name)
+                    await crud_images.update_image_fields(
+                        db,
+                        db_image,
+                        {"layer_name": layer_name, "wms_url": wms_url},
+                    )
+                    await db.commit()
+                    published = True
+                except Exception as exc:
+                    await db.rollback()
+                    geoserver_error = str(exc)
+                    logger.exception(
+                        "GeoServer publish failed in chunk complete: upload_id=%s image_id=%s layer_name=%s user_id=%s",
+                        upload_id,
+                        getattr(db_image, "id", None),
+                        layer_name,
+                        getattr(current_user, "id", None),
+                    )
+
+            refreshed = await crud_images.get_image_by_id(db, db_image.id, current_user.id)
+            payload_image = refreshed or db_image
+            result = {
+                **_serialize_image_json(payload_image),
+                "upload_id": upload_id,
+                "published": published,
+            }
+            if geoserver_error:
+                result["geoserver_error"] = geoserver_error
+            meta["status"] = "completed"
+            meta["result"] = result
+            _save_meta(upload_id, meta)
+
+            msg = "影像上传成功" if published else "影像已入库，GeoServer 图层发布失败，请稍后手动发布"
+            return success_response(message=msg, data=result)
 
     except HTTPException:
         await db.rollback()
@@ -624,11 +672,6 @@ async def complete_upload(
         if tif_path and tif_path.exists():
             tif_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"上传失败: {str(exc)}")
-    finally:
-        try:
-            lock_path.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 @router.post("/upload", summary="上传影像（整文件，兼容旧流程）")
@@ -785,7 +828,7 @@ async def search_images(
         raise HTTPException(status_code=500, detail=f"搜索影像失败: {str(exc)}")
 
 
-@router.get("/{image_id}", response_model=ImageResponse, summary="根据ID获取影像")
+@router.get("/{image_id}", summary="根据ID获取影像")
 async def get_image(image_id: int, db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
     """
     根据ID获取当前用户的影像记录
@@ -793,7 +836,10 @@ async def get_image(image_id: int, db: AsyncSession = Depends(get_db), current_u
     image = await crud_images.get_image_by_id(db, image_id, current_user.id)
     if not image:
         raise HTTPException(status_code=404, detail="影像不存在")
-    return ImageResponse.model_validate(_serialize_image(image))
+    return success_response(
+        message="获取成功",
+        data=ImageResponse.model_validate(_serialize_image(image)).model_dump(mode="json"),
+    )
 
 
 def _safe_unlink(file_path: Optional[str]) -> None:
