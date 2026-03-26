@@ -757,7 +757,7 @@ async def upload_image(
             message="影像上传成功",
             data={
                 **_serialize_image_json(payload_image),
-                "published": True,
+                "published": wms_url is not None,
             },
         )
 

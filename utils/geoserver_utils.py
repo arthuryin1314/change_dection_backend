@@ -1,10 +1,11 @@
+import asyncio
 import httpx
-from pathlib import Path
-import rasterio
-from rasterio.warp import transform_bounds
 import os
 import xml.etree.ElementTree as ET
-
+from pathlib import Path
+import rasterio
+from rasterio.crs import CRS
+from rasterio.warp import transform_bounds
 
 
 GEOSERVER_URL =os.environ.get('GEOSERVER_URL')
@@ -28,11 +29,54 @@ if missing_env_vars:
 
 _AUTH     = (GEOSERVER_USER, GEOSERVER_PASSWORD)
 _XML_HDR  = {"Content-Type": "application/xml"}
+_REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+_RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
+_RETRYABLE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_MAX_RETRIES = 3
+_BASE_RETRY_DELAY_SECONDS = 0.5
 
 
 async def _req(method: str, url: str, **kwargs) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=30) as client:
-        return await client.request(method, url, auth=_AUTH, **kwargs)
+    method = method.upper()
+    can_retry = method in _RETRYABLE_METHODS
+    last_error: Exception | None = None
+    last_response: httpx.Response | None = None
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await client.request(method, url, auth=_AUTH, **kwargs)
+
+                if response.status_code in _RETRYABLE_STATUS_CODES:
+                    last_response = response
+                    if can_retry and attempt < _MAX_RETRIES - 1:
+                        await asyncio.sleep(_BASE_RETRY_DELAY_SECONDS * (2 ** attempt))
+                        continue
+                    break
+
+                return response
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+                last_error = exc
+                if not can_retry or attempt >= _MAX_RETRIES - 1:
+                    break
+                await asyncio.sleep(_BASE_RETRY_DELAY_SECONDS * (2 ** attempt))
+
+    if last_response is not None:
+        response_text = (last_response.text or "").strip()
+        if len(response_text) > 300:
+            response_text = response_text[:300] + "..."
+        detail = (
+            f"; 最后状态码: {last_response.status_code}"
+            + (f"; 响应: {response_text}" if response_text else "")
+        )
+    elif last_error is not None:
+        detail = f"; 最后错误: {last_error.__class__.__name__}: {last_error}"
+    else:
+        detail = ""
+
+    raise RuntimeError(
+        f"GeoServer 请求失败: {method} {url}{detail}"
+    ) from last_error
 
 
 async def _ensure_workspace() -> None:
@@ -169,7 +213,7 @@ def get_tif_bbox_wgs84(tif_path: Path) -> list[float]:
             ]
 
         lon_min, lat_min, lon_max, lat_max = transform_bounds(
-            crs, "EPSG:4326",
+            crs, CRS.from_epsg(4326),
             bounds.left, bounds.bottom, bounds.right, bounds.top
         )
         return [
