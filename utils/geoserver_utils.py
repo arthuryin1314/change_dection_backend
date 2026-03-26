@@ -37,25 +37,30 @@ _BASE_RETRY_DELAY_SECONDS = 0.5
 async def _req(method: str, url: str, **kwargs) -> httpx.Response:
     last_error: Exception | None = None
 
-    for attempt in range(_MAX_RETRIES):
-        try:
-            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+        for attempt in range(_MAX_RETRIES):
+            try:
                 response = await client.request(method, url, auth=_AUTH, **kwargs)
 
-            # 对暂时性服务异常做有限重试，避免瞬时抖动直接失败。
-            if response.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
-                await asyncio.sleep(_BASE_RETRY_DELAY_SECONDS * (2 ** attempt))
-                continue
+                # 对暂时性服务异常做有限重试，避免瞬时抖动直接失败。
+                if response.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
+                    await asyncio.sleep(_BASE_RETRY_DELAY_SECONDS * (2 ** attempt))
+                    continue
 
-            return response
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
-            last_error = exc
-            if attempt >= _MAX_RETRIES - 1:
-                break
-            await asyncio.sleep(_BASE_RETRY_DELAY_SECONDS * (2 ** attempt))
+                return response
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+                last_error = exc
+                if attempt >= _MAX_RETRIES - 1:
+                    break
+                await asyncio.sleep(_BASE_RETRY_DELAY_SECONDS * (2 ** attempt))
+
+    if last_error is not None:
+        detail = f"; 最后错误: {last_error.__class__.__name__}: {last_error}"
+    else:
+        detail = ""
 
     raise RuntimeError(
-        f"GeoServer 请求失败，已重试 {_MAX_RETRIES} 次: {method} {url}"
+        f"GeoServer 请求失败，已重试 {_MAX_RETRIES} 次: {method} {url}{detail}"
     ) from last_error
 
 
