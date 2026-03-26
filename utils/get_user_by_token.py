@@ -24,7 +24,7 @@ async def get_current_user(
     result = await db.execute(query)
     user = result.scalar_one_or_none()
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户未被发现")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token过期或无效")
     if user.token_version != payload["token_version"]:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token过期或无效")
     return user
