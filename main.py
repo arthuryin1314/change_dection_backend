@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from router import users
 from utils.exception_handler import register_exception_handlers
 from router import images
+from router import segment
 from utils import deeplab_service
 
 
@@ -33,4 +34,5 @@ app.add_middleware(
 )
 app.include_router(users.router)
 app.include_router(images.router)
+app.include_router(segment.router)
 register_exception_handlers(app)
