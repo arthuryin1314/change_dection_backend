@@ -22,6 +22,9 @@ router = APIRouter(prefix="/api", tags=["segment"])
 
 _SRS_RE = re.compile(r"^EPSG:\d{4,6}$", re.IGNORECASE)
 _WMS_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+_WMS_RETRYABLE_CODES = {429, 502, 503, 504}
+_WMS_MAX_RETRIES = 3
+_WMS_BASE_DELAY = 0.5
 
 
 class SegmentRequest(BaseModel):
@@ -109,19 +112,34 @@ def _build_getmap_url(
 
 async def _fetch_wms_png(url: str) -> bytes:
     auth = (GEOSERVER_USER, GEOSERVER_PASSWORD) if GEOSERVER_USER and GEOSERVER_PASSWORD else None
+    last_response: httpx.Response | None = None
+
     async with httpx.AsyncClient(timeout=_WMS_TIMEOUT) as client:
-        response = await client.get(url, auth=auth)
+        for attempt in range(_WMS_MAX_RETRIES):
+            try:
+                response = await client.get(url, auth=auth)
+                if response.status_code in _WMS_RETRYABLE_CODES and attempt < _WMS_MAX_RETRIES - 1:
+                    last_response = response
+                    await asyncio.sleep(_WMS_BASE_DELAY * (2 ** attempt))
+                    continue
+                last_response = response
+                break
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
+                if attempt < _WMS_MAX_RETRIES - 1:
+                    await asyncio.sleep(_WMS_BASE_DELAY * (2 ** attempt))
+                    continue
+                raise
 
-    if response.status_code != 200:
-        detail = response.text[:300] if response.text else response.reason_phrase
-        raise HTTPException(status_code=502, detail=f"GeoServer GetMap 失败 [{response.status_code}]: {detail}")
+    if last_response.status_code != 200:
+        detail = last_response.text[:300] if last_response.text else last_response.reason_phrase
+        raise HTTPException(status_code=502, detail=f"GeoServer GetMap 失败 [{last_response.status_code}]: {detail}")
 
-    content_type = response.headers.get("content-type", "").lower()
-    if "image" not in content_type and not response.content.startswith(b"\x89PNG"):
-        detail = response.text[:300] if response.text else "响应不是图片"
+    content_type = last_response.headers.get("content-type", "").lower()
+    if "image" not in content_type and not last_response.content.startswith(b"\x89PNG"):
+        detail = last_response.text[:300] if last_response.text else "响应不是图片"
         raise HTTPException(status_code=502, detail=f"GeoServer GetMap 响应异常: {detail}")
 
-    return response.content
+    return last_response.content
 
 
 def _open_image(image_bytes: bytes) -> Image.Image:

@@ -91,7 +91,7 @@ class Xception(nn.Module):
         elif downsample_factor == 16:
             stride_list = [2,2,1]
         else:
-            raise ValueError('xception.py: output stride=%d is not supported.'%os) 
+            raise ValueError('xception.py: output stride=%d is not supported.' % downsample_factor)
         self.conv1 = nn.Conv2d(3, 32, 3, 2, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(32, momentum=bn_mom)
         self.relu = nn.ReLU(inplace=True)

@@ -68,6 +68,7 @@ class DeeplabV3(object):
         self.__dict__.update(self._defaults)
         for name, value in kwargs.items():
             setattr(self, name, value)
+        self.cuda = self.cuda and torch.cuda.is_available()
         #---------------------------------------------------#
         #   画框设置不同的颜色
         #---------------------------------------------------#
