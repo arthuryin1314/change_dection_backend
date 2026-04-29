@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,10 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from router import users
 from utils.exception_handler import register_exception_handlers
 from router import images
+from utils import deeplab_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await asyncio.to_thread(deeplab_service.load_model)
     images.start_tmp_cleanup_task()
     try:
         yield
