@@ -1,14 +1,12 @@
 import io
 from typing import Optional
 
-import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from deeplab import DeeplabV3
-from utils.utils import cvtColor, preprocess_input, resize_image
+from utils.predict_large_image import SlidingWindowPredictor
+from utils.utils import cvtColor
 
 _model: Optional[DeeplabV3] = None
 
@@ -25,31 +23,26 @@ def get_model() -> DeeplabV3:
 
 
 def _predict_mask(pil_image: Image.Image) -> np.ndarray:
-    """Run inference and return a class-index mask with shape (H, W)."""
+    """Run sliding-window inference and return a class-index mask with shape (H, W)."""
     model = get_model()
+    predictor = SlidingWindowPredictor(model)
+
     image = cvtColor(pil_image)
-    h, w = np.array(image).shape[:2]
+    original_w, original_h = image.size
+    image_np = np.array(image)
 
-    image_data, nw, nh = resize_image(image, (model.input_shape[1], model.input_shape[0]))
-    image_data = np.expand_dims(
-        np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0
-    )
+    result = np.zeros((original_h, original_w), dtype=np.uint8)
 
-    with torch.no_grad():
-        images = torch.from_numpy(image_data)
-        if model.cuda:
-            images = images.cuda()
+    for y in range(0, original_h, predictor.stride):
+        for x in range(0, original_w, predictor.stride):
+            y2 = min(y + predictor.tile_size, original_h)
+            x2 = min(x + predictor.tile_size, original_w)
+            y1 = max(0, y2 - predictor.tile_size)
+            x1 = max(0, x2 - predictor.tile_size)
+            tile = image_np[y1:y2, x1:x2]
+            result[y1:y2, x1:x2] = predictor._predict_tile(tile)
 
-        pr = model.net(images)[0]
-        pr = F.softmax(pr.permute(1, 2, 0), dim=-1).cpu().numpy()
-        pr = pr[
-            int((model.input_shape[0] - nh) // 2): int((model.input_shape[0] - nh) // 2 + nh),
-            int((model.input_shape[1] - nw) // 2): int((model.input_shape[1] - nw) // 2 + nw),
-        ]
-        pr = cv2.resize(pr, (w, h), interpolation=cv2.INTER_LINEAR)
-        pr = pr.argmax(axis=-1)
-
-    return pr
+    return result
 
 
 def segment_rgba_png(pil_image: Image.Image, classes: Optional[list[int]] = None) -> bytes:

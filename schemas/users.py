@@ -69,10 +69,10 @@ class UserLoginRequest(BaseModel):
 
 
 class UserUpdateRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=50, description="用户名")
+    username: str = Field(..., min_length=1, max_length=50, description="用户名")
     telNum: str = Field(..., min_length=11, max_length=11, description="电话号码")
 
-    @field_validator("name", mode="before")
+    @field_validator("username", mode="before")
     @classmethod
     def validate_name(cls, value) -> str:
         return _strip_required(value, "用户名")
