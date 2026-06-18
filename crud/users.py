@@ -44,7 +44,7 @@ async def update_user_info(db:AsyncSession,user_info:UserUpdateRequest,user_id:i
     result = await db.execute(query)
     user = result.scalar_one_or_none()
     if user:
-        user.username = user_info.name
+        user.username = user_info.username
         user.phone = user_info.telNum
         await db.flush()
         return user

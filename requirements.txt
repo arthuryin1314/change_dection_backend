@@ -22,3 +22,10 @@ rasterio>=1.3.9            # 读取 TIF bbox
 
 # 可选：Redis 缓存（如果用到）
 redis>=5.0.1
+
+# 地物识别（DeepLabV3+）
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0

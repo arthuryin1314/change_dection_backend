@@ -3,3 +3,19 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# IDE
+.idea/
+
+# pytest
+.pytest_cache/
+
+# 用户上传的数据文件
+uploads/
+
+# oh-my-claudecode 工具状态
+.omc/
+docs/superpowers/
+
+# PyTorch 模型权重（大型二进制文件）
+*.pth
