@@ -41,3 +41,12 @@ class MLModelListResponse(BaseModel):
     total: int
     page: int
     pageSize: int
+
+
+class MLModelUpdateRequest(BaseModel):
+    """模型编辑请求"""
+
+    model_name: Optional[str] = None
+    model_type: Optional[str] = None
+    framework: Optional[str] = None
+    description: Optional[str] = None
