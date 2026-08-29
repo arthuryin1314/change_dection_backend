@@ -1,56 +1,78 @@
-### 上传影像（带FormData）
-POST http://localhost:8000/api/images/upload
-Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+### 1. 初始化上传会话（请按测试文件修改大小、分片数和 MD5）
+# @name beginUpload
+POST http://localhost:8000/api/images/uploads
+Content-Type: application/json
 
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="image_name"
+{
+  "fileName": "test_image.tif",
+  "fileSize": 1024,
+  "chunkSize": 1024,
+  "totalChunks": 1,
+  "fileHash": "00000000000000000000000000000000"
+}
+
+### 2. 上传分片
+PUT http://localhost:8000/api/images/uploads/{{beginUpload.response.body.$.data.uploadId}}/chunks/0
+Content-Type: multipart/form-data; boundary=Boundary
+
+--Boundary
+Content-Disposition: form-data; name="chunk"; filename="0.part"
+Content-Type: application/octet-stream
+
+< ./path/to/your/image.tif
+--Boundary--
+
+### 3. 完成创建
+POST http://localhost:8000/api/images
+Content-Type: multipart/form-data; boundary=Boundary
+
+--Boundary
+Content-Disposition: form-data; name="uploadId"
+
+{{beginUpload.response.body.$.data.uploadId}}
+--Boundary
+Content-Disposition: form-data; name="imageName"
 
 小明图
-------WebKitFormBoundary7MA4YWxkTrZu0gW
+--Boundary
 Content-Disposition: form-data; name="resolution"
 
-1m
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="capture_date"
+1
+--Boundary
+Content-Disposition: form-data; name="captureDate"
 
 2025-03-03
-------WebKitFormBoundary7MA4YWxkTrZu0gW
+--Boundary
 Content-Disposition: form-data; name="satellite"
 
 swot
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="type"
+--Boundary
+Content-Disposition: form-data; name="imageType"
 
 dom
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="region_code"
+--Boundary
+Content-Disposition: form-data; name="regionCode"
 
 320612001
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="image_file"; filename="test_image.tif"
-Content-Type: image/tiff
-
-< ./path/to/your/image.tif
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="shp_files"; filename="boundary.shp"
+--Boundary
+Content-Disposition: form-data; name="boundaryFiles"; filename="boundary.shp"
 Content-Type: application/octet-stream
 
 < ./path/to/your/boundary.shp
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="shp_files"; filename="boundary.dbf"
+--Boundary
+Content-Disposition: form-data; name="boundaryFiles"; filename="boundary.dbf"
 Content-Type: application/octet-stream
 
 < ./path/to/your/boundary.dbf
-------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="shp_files"; filename="boundary.prj"
+--Boundary
+Content-Disposition: form-data; name="boundaryFiles"; filename="boundary.prj"
 Content-Type: application/octet-stream
 
 < ./path/to/your/boundary.prj
-------WebKitFormBoundary7MA4YWxkTrZu0gW--
+--Boundary--
 
 ### 获取分页影像列表
 GET http://localhost:8000/api/images?page=1&pageSize=10
 
 ### 根据ID获取影像
 GET http://localhost:8000/api/images/1
-

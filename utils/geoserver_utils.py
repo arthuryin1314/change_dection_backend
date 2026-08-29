@@ -192,6 +192,17 @@ async def publish_geotiff_layer(tif_path: Path, layer_name: str) -> str:
     )
     return wms_url
 
+
+async def delete_geotiff_layer(layer_name: str) -> None:
+    response = await _req(
+        "DELETE",
+        f"{GEOSERVER_URL}/rest/workspaces/{GEOSERVER_WORKSPACE}"
+        f"/coveragestores/{layer_name}?recurse=true",
+    )
+    if response.status_code not in (200, 202, 404):
+        raise RuntimeError(f"删除 CoverageStore 失败 [{response.status_code}]: {response.text}")
+
+
 def get_tif_bbox_wgs84(tif_path: Path) -> list[float]:
     """
     用 rasterio 读取 GeoTIFF 空间范围，统一转换为 WGS84。

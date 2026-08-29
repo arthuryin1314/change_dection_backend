@@ -158,50 +158,11 @@
         const API_BASE_URL = 'http://localhost:8000/api';
 
         // 上传表单提交
-        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+        document.getElementById('uploadForm').addEventListener('submit', (e) => {
             e.preventDefault();
 
-            const formData = new FormData();
-            formData.append('image_name', document.getElementById('image_name').value);
-            formData.append('resolution', document.getElementById('resolution').value);
-            formData.append('capture_date', document.getElementById('capture_date').value);
-            formData.append('satellite', document.getElementById('satellite').value);
-            formData.append('type', document.getElementById('type').value);
-            formData.append('region_code', document.getElementById('region_code').value);
-
-            // 添加影像文件
-            const imageFile = document.getElementById('image_file').files[0];
-            if (imageFile) {
-                formData.append('image_file', imageFile);
-            }
-
-            // 添加shapefile文件
-            const shpFiles = document.getElementById('shp_files').files;
-            for (let i = 0; i < shpFiles.length; i++) {
-                formData.append('shp_files', shpFiles[i]);
-            }
-
             const statusDiv = document.getElementById('uploadStatus');
-            statusDiv.innerHTML = '<div class="status">上传中...</div>';
-
-            try {
-                const response = await fetch(`${API_BASE_URL}/images/upload`, {
-                    method: 'POST',
-                    body: formData
-                });
-
-                const result = await response.json();
-
-                if (response.ok) {
-                    statusDiv.innerHTML = `<div class="status success">上传成功！影像ID: ${result.data.id}</div>`;
-                    document.getElementById('uploadForm').reset();
-                    loadImages(); // 刷新列表
-                } else {
-                    statusDiv.innerHTML = `<div class="status error">上传失败: ${result.detail || '未知错误'}</div>`;
-                }
-            } catch (error) {
-                statusDiv.innerHTML = `<div class="status error">网络错误: ${error.message}</div>`;
-            }
+            statusDiv.innerHTML = '<div class="status error">上传现已使用 MD5 分片会话，请通过前端应用或 test_images_api.http 测试。</div>';
         });
 
         // 加载影像列表

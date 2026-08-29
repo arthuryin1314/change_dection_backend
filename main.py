@@ -11,7 +11,7 @@ from models.Base import Base
 from models import ml_models as ml_model_metadata
 from router import users
 from utils.exception_handler import register_exception_handlers
-from router import images
+from router.image import images
 from router import segment
 from router import ml_models
 from utils import deeplab_service
