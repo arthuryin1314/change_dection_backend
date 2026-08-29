@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from config.db_config import get_db
 from crud import images as crud_images
-from schemas.images import ImageResponse
+from schemas.images import ImagePageData, ImagePageResponse, ImageResponse
 from utils.geoserver_utils import publish_geotiff_layer, get_tif_bbox_wgs84
 from utils.response import success_response
 from utils.date_parser import parse_capture_date
@@ -791,52 +791,35 @@ async def upload_image(
         raise HTTPException(status_code=500, detail=f"上传失败: {str(exc)}")
 
 
-@router.get("/list", summary="获取分页影像列表")
-async def get_images_list(
-        page:int=Query(1,ge=1,description='页码从1开始'),
-        page_size:int=Query(10,ge=1,description='每页默认展示10条',alias='pageSize'),
-        db: AsyncSession = Depends(get_db),
-        current_user=Depends(get_current_user)
-):
-    """
-    获取当前用户的影像记录，按上传时间降序排列
-    需要Bearer token认证
-    """
-    try:
-        offset = (page - 1) * page_size
-        images,total_count = await crud_images.get_paginated_images(db, current_user.id,offset, page_size)
-        data = [
-            ImageResponse.model_validate(_serialize_image(image)).model_dump(mode="json")
-            for image in images
-        ]
-        return success_response(message='获取成功',data={
-            "items":data,
-            "total":total_count,
-            "page":page,
-            "page_size":page_size,
-            "total_pages":(total_count + page_size - 1) // page_size
-
-        })
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"获取影像列表失败: {str(exc)}")
-
-
-@router.get("/search", summary="搜索影像")
-async def search_images(
-    q: Optional[str] = Query(None, description="影像名称关键字"),
+@router.get("", response_model=ImagePageResponse, summary="查询影像目录")
+async def query_images(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100, alias="pageSize"),
+    keyword: Optional[str] = Query(None, max_length=100),
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """按名称模糊搜索当前用户影像，返回数组。"""
     try:
-        images = await crud_images.search_images(db, current_user.id, q)
-        data = [
-            ImageResponse.model_validate(_serialize_image(image)).model_dump(mode="json")
-            for image in images
-        ]
-        return success_response(message="搜索成功", data=data)
+        items, total = await crud_images.query_images(
+            db,
+            current_user.id,
+            page,
+            page_size,
+            keyword,
+        )
+        data = ImagePageData(
+            items=[_serialize_image(image) for image in items],
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=(total + page_size - 1) // page_size,
+        )
+        return success_response(
+            message="获取成功",
+            data=data.model_dump(mode="json", by_alias=True),
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"搜索影像失败: {str(exc)}")
+        raise HTTPException(status_code=500, detail=f"获取影像目录失败: {str(exc)}")
 
 
 @router.get("/{image_id}", summary="根据ID获取影像")

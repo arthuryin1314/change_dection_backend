@@ -155,7 +155,7 @@
     </div>
 
     <script>
-        const API_BASE_URL = 'http://localhost:8000';
+        const API_BASE_URL = 'http://localhost:8000/api';
 
         // 上传表单提交
         document.getElementById('uploadForm').addEventListener('submit', async (e) => {
@@ -210,8 +210,9 @@
             tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">加载中...</td></tr>';
 
             try {
-                const response = await fetch(`${API_BASE_URL}/images/list`);
-                const images = await response.json();
+                const response = await fetch(`${API_BASE_URL}/images`);
+                const result = await response.json();
+                const images = result.data.items;
 
                 if (images.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">暂无数据</td></tr>';

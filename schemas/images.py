@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -32,6 +32,20 @@ class ImageResponse(BaseModel):
     dbf_path: Optional[str] = None
     prj_path: Optional[str] = None
     upload_time: Optional[datetime]
+
+
+class ImagePageData(BaseModel):
+    items: List[ImageResponse]
+    total: int
+    page: int
+    page_size: int = Field(serialization_alias="pageSize")
+    total_pages: int = Field(serialization_alias="totalPages")
+
+
+class ImagePageResponse(BaseModel):
+    code: int
+    message: str
+    data: ImagePageData
 
 
 class BoundaryFileResponse(BaseModel):

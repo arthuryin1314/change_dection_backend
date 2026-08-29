@@ -63,23 +63,30 @@ async def create_boundary_files(
     return db_boundary
 
 
-async def get_paginated_images(db: AsyncSession, user_id: int,offset:int,limit:int):
-    """ 分页版本展示"""
-    query = select(func.count()).select_from(Image).where(Image.user_id == user_id)
-    count_result = await db.execute(query)
-    total_count = count_result.scalar() or 0
+async def query_images(
+    db: AsyncSession,
+    user_id: int,
+    page: int,
+    page_size: int,
+    keyword: Optional[str] = None,
+) -> tuple[List[Image], int]:
+    filters = [Image.user_id == user_id]
+    keyword = (keyword or "").strip()
+    if keyword:
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        filters.append(Image.image_name.ilike(f"%{escaped}%", escape="\\"))
 
-    page_query = (
+    count_result = await db.execute(select(func.count()).select_from(Image).where(*filters))
+    total = count_result.scalar() or 0
+    result = await db.execute(
         select(Image)
         .options(selectinload(Image.boundary_files))
-        .where(Image.user_id == user_id)
+        .where(*filters)
         .order_by(Image.upload_time.desc())
-        .offset(offset)
-        .limit(limit)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     )
-    result = await db.execute(page_query)
-    images = result.scalars().all()
-    return images,total_count
+    return list(result.scalars().all()), total
 
 
 async def get_image_by_id(db: AsyncSession, image_id: int, user_id: int) -> Optional[Image]:
@@ -191,26 +198,3 @@ async def delete_images_by_user_with_files(db: AsyncSession, user_id: int) -> Di
         "img_paths": image_paths,
         "boundary_paths": boundary_paths,
     }
-
-
-# crud/images.py
-async def search_images(
-    db: AsyncSession,
-    user_id: int,
-    query_str: Optional[str] = None,
-) -> List[Image]:
-    stmt = (
-        select(Image)
-        .options(selectinload(Image.boundary_files))
-        .where(Image.user_id == user_id)
-    )
-
-    keyword = (query_str or "").strip()
-    if keyword:
-        # 转义 LIKE 通配符，避免把用户输入当成模式
-        esc = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        stmt = stmt.where(Image.image_name.ilike(f"%{esc}%", escape="\\"))
-
-    stmt = stmt.order_by(Image.upload_time.desc())
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
