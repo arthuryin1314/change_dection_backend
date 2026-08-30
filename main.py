@@ -5,12 +5,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from config.db_config import async_engine
+from config.db_config import AsyncSessionLocal, async_engine
 from models.Base import Base
 from models import ml_models as ml_model_metadata
 from router import users
 from utils.exception_handler import register_exception_handlers
 from router.image import images
+from router.image import image_lifecycle
+from router.image import upload_sessions
 from router import segment
 from router import ml_models
 
@@ -20,11 +22,14 @@ async def lifespan(app: FastAPI):
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    images.start_tmp_cleanup_task()
+    await image_lifecycle.recover_cleanup_operations(AsyncSessionLocal)
+    upload_sessions.start_tmp_cleanup_task()
+    image_lifecycle.start_cleanup_task()
     try:
         yield
     finally:
-        await images.stop_tmp_cleanup_task()
+        await image_lifecycle.stop_cleanup_task()
+        await upload_sessions.stop_tmp_cleanup_task()
 
 
 origins = ['http://localhost:5173']

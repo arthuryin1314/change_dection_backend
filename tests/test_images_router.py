@@ -21,8 +21,9 @@ from sqlalchemy.sql import Select
 
 from config.db_config import get_db
 from crud import images as crud_images
-from router.image import image_upload_edit_workflow as workflow
+from router.image import image_lifecycle as workflow
 from router.image import images
+from router.image import upload_sessions
 from utils.get_user_by_token import get_current_user
 
 
@@ -136,6 +137,20 @@ def test_get_image_returns_404_when_the_record_is_missing():
     assert response.json()["detail"] == "影像不存在"
 
 
+def test_delete_image_keeps_contract_through_lifecycle_owner():
+    client = _make_client()
+
+    with patch.object(
+        images.image_lifecycle,
+        "delete_image",
+        new=AsyncMock(return_value=True),
+    ):
+        response = client.delete("/api/images/delete/9")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"id": 9}
+
+
 def test_query_images_uses_one_escaped_filter_for_count_and_page():
     expected_items = [_image()]
     db = SimpleNamespace(execute=AsyncMock(side_effect=[
@@ -185,7 +200,7 @@ def test_begin_upload_returns_the_resumable_session_contract():
 
 def test_upload_chunk_is_reported_when_the_session_is_resumed():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
-        workflow,
+        upload_sessions,
         "TMP_UPLOAD_DIR",
         Path(temp_dir),
     ):
@@ -199,7 +214,11 @@ def test_upload_chunk_is_reported_when_the_session_is_resumed():
         }
 
         upload_id = client.post("/api/images/uploads", json=payload).json()["data"]["uploadId"]
-        with patch.object(workflow, "_save_meta", wraps=workflow._save_meta) as save_meta:
+        with patch.object(
+            upload_sessions,
+            "save_session",
+            wraps=upload_sessions.save_session,
+        ) as save_meta:
             response = client.put(
                 f"/api/images/uploads/{upload_id}/chunks/0",
                 files={"chunk": ("0.part", b"abcd", "application/octet-stream")},
@@ -225,7 +244,7 @@ def test_create_image_accepts_the_new_multipart_contract():
 
     with patch.object(
         images,
-        "create_image_from_upload",
+        "create_image_asset",
         new=AsyncMock(return_value=_image()),
         create=True,
     ):
@@ -248,7 +267,7 @@ def test_edit_image_accepts_metadata_without_a_new_tif():
 
     with patch.object(
         images,
-        "edit_image_workflow",
+        "edit_image_asset",
         new=AsyncMock(return_value=_image(image_name="新名称")),
     ) as edit:
         response = client.put("/api/images/1", data={"imageName": "新名称"})
@@ -288,7 +307,7 @@ def test_create_rejects_a_tif_whose_backend_md5_does_not_match():
         image_dir = temp_root / "images"
         image_dir.mkdir()
         with (
-            patch.object(workflow, "TMP_UPLOAD_DIR", temp_root),
+            patch.object(upload_sessions, "TMP_UPLOAD_DIR", temp_root),
             patch.object(workflow, "IMAGE_DIR", image_dir),
         ):
             client = _make_client()
@@ -324,7 +343,7 @@ def test_create_rejects_a_tif_whose_backend_md5_does_not_match():
 
 def test_missing_upload_session_returns_404_instead_of_500():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
-        workflow,
+        upload_sessions,
         "TMP_UPLOAD_DIR",
         Path(temp_dir),
     ):
@@ -348,7 +367,7 @@ def test_missing_upload_session_returns_404_instead_of_500():
 def test_unknown_workflow_errors_do_not_leak_internal_details():
     with patch.object(
         images,
-        "create_image_from_upload",
+        "create_image_asset",
         new=AsyncMock(side_effect=RuntimeError(r"E:\\secret\\image.tif")),
     ):
         response = _make_client().post("/api/images", data={
@@ -372,20 +391,20 @@ def test_unknown_workflow_errors_do_not_leak_internal_details():
 
 def test_cleanup_reclaims_a_stale_completion_lock():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
-        workflow,
+        upload_sessions,
         "TMP_UPLOAD_DIR",
         Path(temp_dir),
     ):
         session_dir = Path(temp_dir) / ("a" * 32)
         session_dir.mkdir()
-        meta_file = session_dir / workflow.SESSION_META_FILE
+        meta_file = session_dir / upload_sessions.SESSION_META_FILE
         meta_file.write_text("{}", encoding="utf-8")
-        lock_file = session_dir / workflow.COMPLETE_LOCK_FILE
+        lock_file = session_dir / upload_sessions.COMPLETE_LOCK_FILE
         lock_file.write_text("", encoding="utf-8")
-        stale_time = time.time() - workflow.UPLOAD_TTL_SECONDS - 1
+        stale_time = time.time() - upload_sessions.UPLOAD_TTL_SECONDS - 1
         os.utime(lock_file, (stale_time, stale_time))
 
-        workflow._cleanup_expired_tmp_uploads()
+        upload_sessions.cleanup_expired_tmp_uploads()
 
         assert session_dir.exists()
         assert not lock_file.exists()
@@ -393,11 +412,11 @@ def test_cleanup_reclaims_a_stale_completion_lock():
 
 def test_create_recovers_a_committed_result_from_a_completing_session():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
-        workflow,
+        upload_sessions,
         "TMP_UPLOAD_DIR",
         Path(temp_dir),
     ):
-        session = workflow.begin_upload_session(
+        session = upload_sessions.begin_upload_session(
             7,
             file_name="river.tif",
             file_size=4,
@@ -406,9 +425,9 @@ def test_create_recovers_a_committed_result_from_a_completing_session():
             file_hash="0" * 32,
         )
         upload_id = session["upload_id"]
-        meta = workflow._load_meta(upload_id)
+        meta = upload_sessions.load_session(upload_id)
         meta.update(status="completing", operation="create", result_image_id=1)
-        workflow._save_meta(upload_id, meta)
+        upload_sessions.save_session(upload_id, meta)
         image = _image()
         db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
         boundary_streams = [
@@ -421,7 +440,7 @@ def test_create_recovers_a_committed_result_from_a_completing_session():
             patch.object(workflow.crud_images, "get_image_by_id", new=AsyncMock(return_value=image)),
             patch.object(workflow.crud_images, "create_image", new=AsyncMock()) as create_record,
         ):
-            result = asyncio.run(workflow.create_image_from_upload(
+            result = asyncio.run(workflow.create_image(
                 db,
                 7,
                 upload_id,
@@ -436,16 +455,16 @@ def test_create_recovers_a_committed_result_from_a_completing_session():
 
         assert result is image
         create_record.assert_not_awaited()
-        assert workflow._load_meta(upload_id)["status"] == "completed"
+        assert upload_sessions.load_session(upload_id)["status"] == "completed"
 
 
 def test_edit_recovers_a_committed_result_from_a_completing_session():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
-        workflow,
+        upload_sessions,
         "TMP_UPLOAD_DIR",
         Path(temp_dir),
     ):
-        session = workflow.begin_upload_session(
+        session = upload_sessions.begin_upload_session(
             7,
             file_name="river.tif",
             file_size=4,
@@ -454,19 +473,23 @@ def test_edit_recovers_a_committed_result_from_a_completing_session():
             file_hash="0" * 32,
         )
         upload_id = session["upload_id"]
-        meta = workflow._load_meta(upload_id)
+        meta = upload_sessions.load_session(upload_id)
         meta.update(
             status="completing",
             operation="edit:1",
             result_image_id=1,
-            tif_path="new.tif",
-            old_tif_path="old.tif",
+            tif_path="uploads/images/new.tif",
+            old_tif_path="uploads/images/old.tif",
             old_layer_name="old-layer",
-            old_boundary_paths=["old.shp", "old.dbf", "old.prj"],
+            old_boundary_paths=[
+                "uploads/shapefiles/old/boundary.shp",
+                "uploads/shapefiles/old/boundary.dbf",
+                "uploads/shapefiles/old/boundary.prj",
+            ],
         )
-        workflow._save_meta(upload_id, meta)
+        upload_sessions.save_session(upload_id, meta)
         image = _image()
-        image.img_path = "new.tif"
+        image.img_path = "uploads/images/new.tif"
         db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
 
         with (
@@ -475,7 +498,7 @@ def test_edit_recovers_a_committed_result_from_a_completing_session():
             patch.object(workflow, "_remove_path") as remove_path,
             patch.object(workflow, "delete_geotiff_layer", new=AsyncMock()) as delete_layer,
         ):
-            result = asyncio.run(workflow.edit_image_workflow(
+            result = asyncio.run(workflow.edit_image(
                 db,
                 7,
                 1,
@@ -492,22 +515,22 @@ def test_edit_recovers_a_committed_result_from_a_completing_session():
         assert result is image
         update.assert_not_awaited()
         assert {call.args[0] for call in remove_path.call_args_list} == {
-            "old.tif",
-            "old.shp",
-            "old.dbf",
-            "old.prj",
+            "uploads/images/old.tif",
+            "uploads/shapefiles/old/boundary.shp",
+            "uploads/shapefiles/old/boundary.dbf",
+            "uploads/shapefiles/old/boundary.prj",
         }
         delete_layer.assert_awaited_once_with("old-layer")
-        assert workflow._load_meta(upload_id)["status"] == "completed"
+        assert upload_sessions.load_session(upload_id)["status"] == "completed"
 
 
 def test_edit_persists_old_resource_cleanup_before_commit():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
-        workflow,
+        upload_sessions,
         "TMP_UPLOAD_DIR",
         Path(temp_dir),
     ):
-        session = workflow.begin_upload_session(
+        session = upload_sessions.begin_upload_session(
             7,
             file_name="river.tif",
             file_size=4,
@@ -517,12 +540,12 @@ def test_edit_persists_old_resource_cleanup_before_commit():
         )
         upload_id = session["upload_id"]
         image = _image()
-        image.img_path = "old.tif"
+        image.img_path = "uploads/images/old.tif"
         image.layer_name = "old-layer"
         image.boundary_files = [SimpleNamespace(
-            shp_path="old.shp",
-            dbf_path="old.dbf",
-            prj_path="old.prj",
+            shp_path="uploads/shapefiles/old/boundary.shp",
+            dbf_path="uploads/shapefiles/old/boundary.dbf",
+            prj_path="uploads/shapefiles/old/boundary.prj",
         )]
 
         async def update_fields(db, record, updates):
@@ -531,8 +554,8 @@ def test_edit_persists_old_resource_cleanup_before_commit():
             return record
 
         async def commit_after_cleanup_is_durable():
-            meta = workflow._load_meta(upload_id)
-            assert meta["old_tif_path"] == "old.tif"
+            meta = upload_sessions.load_session(upload_id)
+            assert meta["old_tif_path"] == "uploads/images/old.tif"
             assert meta["old_layer_name"] == "old-layer"
             assert "old_boundary_paths" not in meta
 
@@ -543,12 +566,16 @@ def test_edit_persists_old_resource_cleanup_before_commit():
         with (
             patch.object(workflow.crud_images, "get_image_by_id", new=AsyncMock(return_value=image)),
             patch.object(workflow.crud_images, "update_image_fields", new=AsyncMock(side_effect=update_fields)),
-            patch.object(workflow, "_merge_tif", return_value=(Path("new.tif"), [1, 2, 3, 4])),
+            patch.object(
+                workflow,
+                "_merge_tif",
+                return_value=(Path("uploads/images/new.tif"), [1, 2, 3, 4]),
+            ),
             patch.object(workflow, "publish_geotiff_layer", new=AsyncMock(return_value="new-wms")),
             patch.object(workflow, "_remove_path") as remove_path,
             patch.object(workflow, "delete_geotiff_layer", new=AsyncMock()) as delete_layer,
         ):
-            asyncio.run(workflow.edit_image_workflow(
+            asyncio.run(workflow.edit_image(
                 db,
                 7,
                 1,
@@ -563,17 +590,19 @@ def test_edit_persists_old_resource_cleanup_before_commit():
             ))
 
         db.commit.assert_awaited_once()
-        assert {call.args[0] for call in remove_path.call_args_list} == {"old.tif"}
+        assert {call.args[0] for call in remove_path.call_args_list} == {
+            "uploads/images/old.tif"
+        }
         delete_layer.assert_awaited_once_with("old-layer")
 
 
 def test_create_does_not_compensate_resources_after_commit_succeeds():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
-        workflow,
+        upload_sessions,
         "TMP_UPLOAD_DIR",
         Path(temp_dir),
     ):
-        session = workflow.begin_upload_session(
+        session = upload_sessions.begin_upload_session(
             7,
             file_name="river.tif",
             file_size=4,
@@ -582,7 +611,7 @@ def test_create_does_not_compensate_resources_after_commit_succeeds():
             file_hash="0" * 32,
         )
         async def commit_after_intent_is_durable():
-            meta = workflow._load_meta(session["upload_id"])
+            meta = upload_sessions.load_session(session["upload_id"])
             assert meta["status"] == "completing"
             assert meta["operation"] == "create"
             assert meta["result_image_id"] == 1
@@ -620,7 +649,7 @@ def test_create_does_not_compensate_resources_after_commit_succeeds():
             patch.object(workflow, "delete_geotiff_layer", new=AsyncMock()) as delete_layer,
             patch.object(workflow, "_remove_path") as remove_path,
         ):
-            result = asyncio.run(workflow.create_image_from_upload(
+            result = asyncio.run(workflow.create_image(
                 db,
                 7,
                 session["upload_id"],

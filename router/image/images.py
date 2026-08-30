@@ -7,13 +7,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.db_config import get_db
 from crud import images as crud_images
-from router.image.image_upload_edit_workflow import (
+from router.image import image_lifecycle
+from router.image.image_lifecycle import (
     WorkflowConflictError,
     WorkflowNotFoundError,
+    create_image as create_image_asset,
+    edit_image as edit_image_asset,
+)
+from router.image.upload_sessions import (
     begin_upload_session,
-    create_image_from_upload,
-    delete_image_workflow,
-    edit_image_workflow,
     save_upload_chunk,
     start_tmp_cleanup_task,
     stop_tmp_cleanup_task,
@@ -171,7 +173,7 @@ async def create_image(
     current_user=Depends(get_current_user),
 ):
     try:
-        image = await create_image_from_upload(
+        image = await create_image_asset(
             db,
             current_user.id,
             upload_id,
@@ -235,7 +237,7 @@ async def edit_image(
     current_user=Depends(get_current_user),
 ):
     try:
-        image = await edit_image_workflow(
+        image = await edit_image_asset(
             db,
             current_user.id,
             image_id,
@@ -274,7 +276,7 @@ async def delete_image(
     current_user=Depends(get_current_user),
 ):
     try:
-        deleted = await delete_image_workflow(db, current_user.id, image_id)
+        deleted = await image_lifecycle.delete_image(db, current_user.id, image_id)
     except Exception as exc:
         _raise_http_error(exc)
     if not deleted:

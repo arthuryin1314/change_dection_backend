@@ -99,6 +99,17 @@ async def get_image_by_id(db: AsyncSession, image_id: int, user_id: int) -> Opti
     return result.scalar_one_or_none()
 
 
+async def count_images_by_ids(db: AsyncSession, user_id: int, image_ids: List[int]) -> int:
+    if not image_ids:
+        return 0
+    result = await db.execute(
+        select(func.count())
+        .select_from(Image)
+        .where(Image.user_id == user_id, Image.id.in_(image_ids))
+    )
+    return result.scalar_one()
+
+
 async def update_image_fields(db: AsyncSession, image: Image, updates: Dict[str, Any]) -> Image:
     """局部更新影像主表字段"""
     for key, value in updates.items():
@@ -176,10 +187,13 @@ async def delete_images_by_user_with_files(db: AsyncSession, user_id: int) -> Di
 
     image_paths: List[str] = []
     boundary_paths: List[str] = []
+    layer_names: List[str] = []
 
     for image in images:
         if image.img_path:
             image_paths.append(image.img_path)
+        if image.layer_name:
+            layer_names.append(image.layer_name)
 
         for bf in image.boundary_files:
             if bf.shp_path:
@@ -195,6 +209,8 @@ async def delete_images_by_user_with_files(db: AsyncSession, user_id: int) -> Di
     await db.flush()
     return {
         "deleted_count": len(images),
+        "image_ids": [image.id for image in images],
         "img_paths": image_paths,
         "boundary_paths": boundary_paths,
+        "layer_names": layer_names,
     }
