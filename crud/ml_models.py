@@ -38,12 +38,18 @@ async def get_ml_models(
     page: int,
     page_size: int,
     keyword: str = "",
+    model_type: Optional[str] = None,
+    framework: Optional[str] = None,
 ) -> tuple[list[MLModel], int]:
     """分页查询当前用户上传的模型记录"""
     stmt = select(MLModel).where(MLModel.user_id == user_id)
 
     if keyword:
         stmt = stmt.where(MLModel.model_name.ilike(f"%{keyword}%"))
+    if model_type:
+        stmt = stmt.where(MLModel.model_type == model_type)
+    if framework:
+        stmt = stmt.where(MLModel.framework == framework)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
     stmt = (

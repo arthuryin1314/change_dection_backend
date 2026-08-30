@@ -101,11 +101,21 @@ async def list_models(
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10, ge=1, le=100),
     keyword: str = Query(default=""),
+    modelType: Optional[str] = Query(default=None),
+    framework: Optional[str] = Query(default=None),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        items, total = await get_ml_models(db, current_user.id, page, pageSize, keyword)
+        items, total = await get_ml_models(
+            db,
+            current_user.id,
+            page,
+            pageSize,
+            keyword,
+            modelType,
+            framework,
+        )
         response = MLModelListResponse(
             items=[
                 MLModelListItem(

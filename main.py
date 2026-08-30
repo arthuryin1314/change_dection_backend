@@ -1,7 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,7 +13,6 @@ from utils.exception_handler import register_exception_handlers
 from router.image import images
 from router import segment
 from router import ml_models
-from utils import deeplab_service
 
 
 @asynccontextmanager
@@ -22,7 +20,6 @@ async def lifespan(app: FastAPI):
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    await asyncio.to_thread(deeplab_service.load_model)
     images.start_tmp_cleanup_task()
     try:
         yield

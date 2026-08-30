@@ -107,7 +107,9 @@ class DeeplabV3(object):
         self.net = DeepLab(num_classes=self.num_classes, backbone=self.backbone, downsample_factor=self.downsample_factor, pretrained=False)
 
         device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net.load_state_dict(torch.load(self.model_path, map_location=device))
+        self.net.load_state_dict(
+            torch.load(self.model_path, map_location=device, weights_only=True)
+        )
         self.net    = self.net.eval()
         print('{} model, and classes loaded.'.format(self.model_path))
         if not onnx:
