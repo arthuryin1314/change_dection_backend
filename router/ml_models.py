@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ from schemas.ml_models import (
     MLModelListResponse,
     MLModelResponse,
 )
-from utils.file_storage import save_upload_file
+from utils.model_asset_storage import ModelAssetTooLargeError, save_upload_file
 from utils.get_user_by_token import get_current_user
 from utils.response import error_response, success_response
 
@@ -32,10 +32,63 @@ WEIGHT_EXTENSIONS = {".pth", ".pt", ".h5", ".onnx", ".pdparams"}
 MODEL_FILE_EXTENSIONS = {".py", ".zip"}
 MAX_WEIGHT_SIZE = 1 * 1024 * 1024 * 1024
 MAX_MODEL_FILE_SIZE = 100 * 1024 * 1024
+MODEL_TYPES = {"semantic_segmentation", "change_detection", "target_extraction"}
+FRAMEWORKS = {"PyTorch", "TensorFlow", "PaddlePaddle", "ONNX"}
 
 
 def _get_suffix(upload_file: UploadFile) -> str:
-    return Path(upload_file.filename or "").suffix.lower()
+    if upload_file.filename is None:
+        return ""
+    return Path(upload_file.filename).suffix.lower()
+
+
+def _validate_metadata(
+    model_name: Optional[str],
+    model_type: Optional[str],
+    framework: Optional[str],
+    description: Optional[str],
+    require_all: bool,
+) -> Optional[str]:
+    if model_name is not None:
+        if not 2 <= len(model_name) <= 40:
+            return "模型名称长度必须为 2-40 个字符"
+    elif require_all:
+        return "模型名称不能为空"
+
+    if model_type is not None:
+        if model_type not in MODEL_TYPES:
+            return "模型类型不合法"
+    elif require_all:
+        return "模型类型不能为空"
+
+    if framework is not None:
+        if framework not in FRAMEWORKS:
+            return "框架不合法"
+    elif require_all:
+        return "框架不能为空"
+
+    if description is not None:
+        minimum = 5 if require_all else 0
+        if not minimum <= len(description) <= 200:
+            return "模型描述长度不合法"
+    elif require_all:
+        return "模型描述不能为空"
+
+    return None
+
+
+def _validate_file(
+    upload_file: UploadFile,
+    extensions: set[str],
+    max_size: int,
+    invalid_message: str,
+    size_message: str,
+) -> Optional[str]:
+    if _get_suffix(upload_file) not in extensions:
+        return invalid_message
+    if upload_file.size is not None and upload_file.size > max_size:
+        return size_message
+    return None
 
 
 def _safe_unlink(file_path: Optional[Path]) -> None:
@@ -43,6 +96,7 @@ def _safe_unlink(file_path: Optional[Path]) -> None:
         return
     try:
         file_path.unlink(missing_ok=True)
+        file_path.parent.rmdir()
     except Exception:
         pass
 
@@ -58,8 +112,35 @@ async def upload_model(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if _get_suffix(weight) not in WEIGHT_EXTENSIONS or _get_suffix(model_file) not in MODEL_FILE_EXTENSIONS:
-        return error_response(400, "不支持的文件类型")
+    validation_error = _validate_metadata(
+        model_name,
+        model_type,
+        framework,
+        description,
+        require_all=True,
+    )
+    if validation_error is not None:
+        return error_response(400, validation_error)
+
+    validation_error = _validate_file(
+        weight,
+        WEIGHT_EXTENSIONS,
+        MAX_WEIGHT_SIZE,
+        "不支持的权重文件类型",
+        "权重文件超过大小限制（最大 1 GB）",
+    )
+    if validation_error is not None:
+        return error_response(400, validation_error)
+
+    validation_error = _validate_file(
+        model_file,
+        MODEL_FILE_EXTENSIONS,
+        MAX_MODEL_FILE_SIZE,
+        "不支持的模型文件类型",
+        "模型文件超过大小限制（最大 100 MB）",
+    )
+    if validation_error is not None:
+        return error_response(400, validation_error)
 
     weight_path: Optional[Path] = None
     model_file_path: Optional[Path] = None
@@ -67,11 +148,15 @@ async def upload_model(
     try:
         weight_path = await save_upload_file(
             weight,
-            BASE_DIR / "uploads" / "weights" / str(current_user.id),
+            BASE_DIR / "uploads" / "model_assets",
+            current_user.id,
+            MAX_WEIGHT_SIZE,
         )
         model_file_path = await save_upload_file(
             model_file,
-            BASE_DIR / "uploads" / "model_files" / str(current_user.id),
+            BASE_DIR / "uploads" / "model_assets",
+            current_user.id,
+            MAX_MODEL_FILE_SIZE,
         )
 
         db_record = await create_ml_model(
@@ -84,10 +169,17 @@ async def upload_model(
             model_file_path=str(model_file_path),
             description=description,
         )
-        await db.commit()
-
         data = MLModelResponse.model_validate(db_record).model_dump(mode="json")
+        await db.commit()
         return success_response(message="上传成功", data=data)
+    except ModelAssetTooLargeError as e:
+        logger.exception("上传模型文件超过大小限制: %s", e)
+        await db.rollback()
+        _safe_unlink(weight_path)
+        _safe_unlink(model_file_path)
+        if e.max_size == MAX_WEIGHT_SIZE:
+            return error_response(400, "权重文件超过大小限制（最大 1 GB）")
+        return error_response(400, "模型文件超过大小限制（最大 100 MB）")
     except Exception as e:
         logger.exception("上传模型失败: %s", e)
         await db.rollback()
@@ -143,6 +235,7 @@ async def list_models(
 @router.put("/{model_id}", summary="更新模型")
 async def update_model(
     model_id: int,
+    request: Request,
     model_name: Optional[str] = Form(None),
     model_type: Optional[str] = Form(None),
     framework: Optional[str] = Form(None),
@@ -156,8 +249,50 @@ async def update_model(
     if record is None:
         return error_response(404, "模型不存在")
 
-    old_w_path = record.weight_file_path if weight else None
-    old_m_path = record.model_file_path if model_file else None
+    form = await request.form()
+    if model_name is None and "model_name" in form:
+        model_name = ""
+    if model_type is None and "model_type" in form:
+        model_type = ""
+    if framework is None and "framework" in form:
+        framework = ""
+    if description is None and "description" in form:
+        description = ""
+
+    validation_error = _validate_metadata(
+        model_name,
+        model_type,
+        framework,
+        description,
+        require_all=False,
+    )
+    if validation_error is not None:
+        return error_response(400, validation_error)
+
+    if weight is not None:
+        validation_error = _validate_file(
+            weight,
+            WEIGHT_EXTENSIONS,
+            MAX_WEIGHT_SIZE,
+            "不支持的权重文件类型",
+            "权重文件超过大小限制（最大 1 GB）",
+        )
+        if validation_error is not None:
+            return error_response(400, validation_error)
+
+    if model_file is not None:
+        validation_error = _validate_file(
+            model_file,
+            MODEL_FILE_EXTENSIONS,
+            MAX_MODEL_FILE_SIZE,
+            "不支持的模型文件类型",
+            "模型文件超过大小限制（最大 100 MB）",
+        )
+        if validation_error is not None:
+            return error_response(400, validation_error)
+
+    old_w_path = Path(record.weight_file_path) if weight is not None else None
+    old_m_path = Path(record.model_file_path) if model_file is not None else None
 
     update_kwargs = {}
     if model_name is not None:
@@ -173,29 +308,21 @@ async def update_model(
     new_m_path: Optional[Path] = None
 
     try:
-        if weight:
-            if _get_suffix(weight) not in WEIGHT_EXTENSIONS:
-                return error_response(400, "不支持的权重文件类型")
-            if weight.size and weight.size > MAX_WEIGHT_SIZE:
-                return error_response(400, "权重文件超过大小限制（最大 1 GB）")
-
-        if model_file:
-            if _get_suffix(model_file) not in MODEL_FILE_EXTENSIONS:
-                return error_response(400, "不支持的模型文件类型")
-            if model_file.size and model_file.size > MAX_MODEL_FILE_SIZE:
-                return error_response(400, "模型文件超过大小限制（最大 100 MB）")
-
-        if weight:
+        if weight is not None:
             new_w_path = await save_upload_file(
                 weight,
-                BASE_DIR / "uploads" / "weights" / str(current_user.id),
+                BASE_DIR / "uploads" / "model_assets",
+                current_user.id,
+                MAX_WEIGHT_SIZE,
             )
             update_kwargs["weight_file_path"] = str(new_w_path)
 
-        if model_file:
+        if model_file is not None:
             new_m_path = await save_upload_file(
                 model_file,
-                BASE_DIR / "uploads" / "model_files" / str(current_user.id),
+                BASE_DIR / "uploads" / "model_assets",
+                current_user.id,
+                MAX_MODEL_FILE_SIZE,
             )
             update_kwargs["model_file_path"] = str(new_m_path)
 
@@ -206,12 +333,18 @@ async def update_model(
 
         await db.commit()
 
-        if old_w_path:
-            _safe_unlink(Path(old_w_path))
-        if old_m_path:
-            _safe_unlink(Path(old_m_path))
+        _safe_unlink(old_w_path)
+        _safe_unlink(old_m_path)
 
         return success_response(message="更新成功")
+    except ModelAssetTooLargeError as e:
+        logger.exception("更新模型文件超过大小限制: %s", e)
+        await db.rollback()
+        _safe_unlink(new_w_path)
+        _safe_unlink(new_m_path)
+        if e.max_size == MAX_WEIGHT_SIZE:
+            return error_response(400, "权重文件超过大小限制（最大 1 GB）")
+        return error_response(400, "模型文件超过大小限制（最大 100 MB）")
     except Exception as e:
         logger.exception("更新模型失败: %s", e)
         await db.rollback()
