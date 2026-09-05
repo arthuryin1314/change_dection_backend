@@ -10,6 +10,15 @@ __pycache__/
 # pytest
 .pytest_cache/
 
+# Ruff 缓存
+.ruff_cache/
+
+# CodeGraph 本机进程状态
+.codegraph/daemon.pid
+
+# 调试生成的图片
+debug_wms_input_*.png
+
 # 用户上传的数据文件
 uploads/
 

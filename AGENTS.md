@@ -73,3 +73,17 @@ S109 Three-part fix specification for model database edit feature: validation ru
 
 Access 137k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues. External pull requests are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The canonical triage labels use their default names: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using root-level `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
