@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 from datetime import datetime
 from io import BytesIO
@@ -85,6 +86,9 @@ def test_creating_same_original_names_keeps_two_real_assets(tmp_path, monkeypatc
             weight_file_path=kwargs["weight_file_path"],
             model_file_path=kwargs["model_file_path"],
             description=kwargs["description"],
+            weight_content_sha256=kwargs["weight_content_sha256"],
+            weight_content_sha256_size=kwargs["weight_content_sha256_size"],
+            weight_content_sha256_mtime_ns=kwargs["weight_content_sha256_mtime_ns"],
             upload_time=datetime.now(),
             updated_time=datetime.now(),
         )
@@ -131,6 +135,9 @@ def test_creating_same_original_names_keeps_two_real_assets(tmp_path, monkeypatc
     assert second_path.name == original_name
     assert first_path.read_bytes() == b"first-weight"
     assert second_path.read_bytes() == b"second-weight"
+    assert records[0].weight_content_sha256 == hashlib.sha256(b"first-weight").hexdigest()
+    assert records[0].weight_content_sha256_size == len(b"first-weight")
+    assert records[1].weight_content_sha256 == hashlib.sha256(b"second-weight").hexdigest()
 
 
 def test_replacing_same_weight_name_keeps_new_file_and_removes_old(tmp_path, monkeypatch):
@@ -146,6 +153,9 @@ def test_replacing_same_weight_name_keeps_new_file_and_removes_old(tmp_path, mon
         model_type="semantic_segmentation",
         framework="PyTorch",
         weight_file_path=str(old_weight),
+        weight_content_sha256="a" * 64,
+        weight_content_sha256_size=old_weight.stat().st_size,
+        weight_content_sha256_mtime_ns=old_weight.stat().st_mtime_ns,
         model_file_path=str(old_model),
         description="原模型描述",
     )
@@ -174,6 +184,9 @@ def test_replacing_same_weight_name_keeps_new_file_and_removes_old(tmp_path, mon
     assert new_weight != old_weight
     assert new_weight.name == old_weight.name
     assert new_weight.read_bytes() == b"new-weight"
+    assert record.weight_content_sha256 == hashlib.sha256(b"new-weight").hexdigest()
+    assert record.weight_content_sha256_size == len(b"new-weight")
+    assert record.weight_content_sha256_mtime_ns == new_weight.stat().st_mtime_ns
     assert not old_weight.exists()
     assert Path(record.model_file_path) == old_model
     assert old_model.read_bytes() == b"old-model"

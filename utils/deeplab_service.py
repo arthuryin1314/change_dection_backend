@@ -1,35 +1,131 @@
 import io
-from threading import RLock
+import hashlib
+from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from threading import RLock, Semaphore
 from typing import Optional
 
 import numpy as np
+import torch
 from PIL import Image
 
 from deeplab import DeeplabV3
+from utils.classification_contract import PIPELINE_VERSION
 from utils.predict_large_image import SlidingWindowPredictor
 from utils.utils import cvtColor
 
-_model: Optional[DeeplabV3] = None
-_model_key: Optional[tuple[int, str]] = None
-# ponytail: one process-wide lock keeps the single-model cache consistent; shard by model/device if throughput requires it.
-_model_lock = RLock()
+MODEL_CACHE_CAPACITY = 2
+
+
+@dataclass(frozen=True)
+class ModelCacheKey:
+    weight_sha256: str
+    pipeline_version: str
+    device: str
+
+
+@dataclass
+class CachedModel:
+    model: DeeplabV3
+    active_references: int = 0
+
+
+_model_cache: OrderedDict[ModelCacheKey, CachedModel] = OrderedDict()
+_weight_digest_cache: dict[tuple[str, int, int], str] = {}
+_cache_lock = RLock()
+_inference_semaphore = Semaphore(1)
 
 
 class ModelLoadError(RuntimeError):
     """The selected weight cannot be loaded by the supported runtime."""
 
 
-def _load_model_unlocked(model_id: int, weight_file_path: str) -> DeeplabV3:
-    global _model, _model_key
+def _load_model_unlocked(weight_file_path: str) -> DeeplabV3:
+    try:
+        return DeeplabV3(model_path=weight_file_path)
+    except Exception as exc:
+        raise ModelLoadError("selected model is incompatible") from exc
 
-    key = (model_id, weight_file_path)
-    if _model is None or _model_key != key:
-        try:
-            _model = DeeplabV3(model_path=weight_file_path)
-        except Exception as exc:
-            raise ModelLoadError("selected model is incompatible") from exc
-        _model_key = key
-    return _model
+
+def _file_sha256(weight_file_path: str) -> str:
+    path = Path(weight_file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"模型权重文件不存在: {path}")
+    stat = path.stat()
+    cache_key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    with _cache_lock:
+        cached = _weight_digest_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    with _cache_lock:
+        _weight_digest_cache[cache_key] = value
+    return value
+
+
+def _evict_inactive_lru() -> None:
+    while len(_model_cache) > MODEL_CACHE_CAPACITY:
+        for key, entry in _model_cache.items():
+            if entry.active_references == 0:
+                del _model_cache[key]
+                break
+        else:
+            return
+
+
+@contextmanager
+def _model_reference(
+    weight_file_path: str,
+    weight_sha256: str | None,
+):
+    digest = (weight_sha256 or _file_sha256(weight_file_path)).lower()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    key = ModelCacheKey(digest, PIPELINE_VERSION, device)
+    with _cache_lock:
+        entry = _model_cache.get(key)
+        if entry is None:
+            entry = CachedModel(_load_model_unlocked(weight_file_path))
+            _model_cache[key] = entry
+        entry.active_references += 1
+        _model_cache.move_to_end(key)
+        _evict_inactive_lru()
+    try:
+        yield entry.model
+    finally:
+        with _cache_lock:
+            entry.active_references -= 1
+            _evict_inactive_lru()
+
+
+def clear_model_cache() -> None:
+    with _cache_lock:
+        if any(entry.active_references for entry in _model_cache.values()):
+            raise RuntimeError("仍有任务正在使用模型缓存")
+        _model_cache.clear()
+        _weight_digest_cache.clear()
+
+
+@contextmanager
+def model_tile_predictor(
+    weight_file_path: str,
+    *,
+    weight_sha256: str,
+):
+    with _model_reference(weight_file_path, weight_sha256) as model:
+        predictor = SlidingWindowPredictor(model)
+
+        def predict_tile(tile: np.ndarray) -> np.ndarray:
+            with _inference_semaphore:
+                return predictor._predict_tile(tile)
+
+        yield predict_tile
 
 
 def _predict_mask(pil_image: Image.Image, model: DeeplabV3) -> np.ndarray:
@@ -49,15 +145,21 @@ def _predict_mask(pil_image: Image.Image, model: DeeplabV3) -> np.ndarray:
             y1 = max(0, y2 - predictor.tile_size)
             x1 = max(0, x2 - predictor.tile_size)
             tile = image_np[y1:y2, x1:x2]
-            result[y1:y2, x1:x2] = predictor._predict_tile(tile)
+            with _inference_semaphore:
+                result[y1:y2, x1:x2] = predictor._predict_tile(tile)
 
     return result
 
 
-def predict_mask(pil_image: Image.Image, model_id: int, weight_file_path: str) -> np.ndarray:
+def predict_mask(
+    pil_image: Image.Image,
+    model_id: int,
+    weight_file_path: str,
+    *,
+    weight_sha256: str | None = None,
+) -> np.ndarray:
     """Infer a class-index mask using the selected model."""
-    with _model_lock:
-        model = _load_model_unlocked(model_id, weight_file_path)
+    with _model_reference(weight_file_path, weight_sha256) as model:
         return _predict_mask(pil_image, model)
 
 
@@ -86,9 +188,10 @@ def segment_rgba_png(
     model_id: int,
     weight_file_path: str,
     classes: Optional[list[int]] = None,
+    *,
+    weight_sha256: str | None = None,
 ) -> bytes:
     """Infer a class mask and independently render it as an RGBA PNG."""
-    with _model_lock:
-        model = _load_model_unlocked(model_id, weight_file_path)
+    with _model_reference(weight_file_path, weight_sha256) as model:
         class_mask = _predict_mask(pil_image, model)
         return render_mask_png(class_mask, model, classes)

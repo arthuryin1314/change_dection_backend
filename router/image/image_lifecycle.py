@@ -24,6 +24,7 @@ from router.image.upload_sessions import (
     session_dir as _session_dir,
 )
 from utils.date_parser import parse_capture_date
+from utils.content_hash import ContentHash
 from utils.geoserver_utils import delete_geotiff_layer, get_tif_bbox_wgs84, publish_geotiff_layer
 
 
@@ -110,7 +111,7 @@ def _save_boundary_files(files: dict[str, BinaryIO], prefix: str) -> tuple[dict[
         raise
 
 
-def _merge_tif(upload_id: str, meta: dict) -> tuple[Path, list[float]]:
+def _merge_tif(upload_id: str, meta: dict) -> tuple[Path, list[float], ContentHash]:
     required = list(range(meta["total_chunks"]))
     if _list_uploaded_chunks(upload_id) != required:
         raise WorkflowInputError("上传分片不完整")
@@ -118,6 +119,7 @@ def _merge_tif(upload_id: str, meta: dict) -> tuple[Path, list[float]]:
     final_path = IMAGE_DIR / f"{uuid4().hex}_{_safe_name(meta['file_name'])}"
     temp_path = final_path.with_suffix(final_path.suffix + ".tmp")
     digest = hashlib.md5()
+    content_digest = hashlib.sha256()
     size = 0
     try:
         with temp_path.open("wb") as output:
@@ -127,11 +129,17 @@ def _merge_tif(upload_id: str, meta: dict) -> tuple[Path, list[float]]:
                     while data := source.read(1024 * 1024):
                         output.write(data)
                         digest.update(data)
+                        content_digest.update(data)
                         size += len(data)
         if size != meta["file_size"] or digest.hexdigest() != meta["file_hash"]:
             raise WorkflowInputError("上传文件 MD5 或大小校验失败")
         temp_path.replace(final_path)
-        return final_path, get_tif_bbox_wgs84(final_path)
+        stat = final_path.stat()
+        return (
+            final_path,
+            get_tif_bbox_wgs84(final_path),
+            ContentHash(content_digest.hexdigest(), stat.st_size, stat.st_mtime_ns),
+        )
     except Exception:
         temp_path.unlink(missing_ok=True)
         final_path.unlink(missing_ok=True)
@@ -245,7 +253,7 @@ async def create_image(
         boundary_paths = {}
         layer_name = None
         try:
-            tif_path, bbox = _merge_tif(upload_id, meta)
+            tif_path, bbox, content_hash = _merge_tif(upload_id, meta)
             boundary_paths, boundary_dir = _save_boundary_files(
                 boundary_group,
                 _safe_prefix(region_code, image_name),
@@ -261,6 +269,9 @@ async def create_image(
                 region_code=region_code,
                 img_path=str(tif_path),
                 bbox=bbox,
+                content_sha256=content_hash.sha256,
+                content_sha256_size=content_hash.size,
+                content_sha256_mtime_ns=content_hash.mtime_ns,
             )
             await crud_images.create_boundary_files(
                 db=db,
@@ -366,8 +377,14 @@ async def edit_image(
             final_name = image_name or image.image_name
             final_region = region_code or image.region_code
             if meta:
-                tif_path, bbox = _merge_tif(normalized_upload_id, meta)
-                updates.update(img_path=str(tif_path), bbox=bbox)
+                tif_path, bbox, content_hash = _merge_tif(normalized_upload_id, meta)
+                updates.update(
+                    img_path=str(tif_path),
+                    bbox=bbox,
+                    content_sha256=content_hash.sha256,
+                    content_sha256_size=content_hash.size,
+                    content_sha256_mtime_ns=content_hash.mtime_ns,
+                )
             if boundary_group:
                 boundary_paths, boundary_dir = _save_boundary_files(
                     boundary_group,

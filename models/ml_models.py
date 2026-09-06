@@ -16,5 +16,8 @@ class MLModel(Base):
     weight_file_path = Column(Text, nullable=False)
     model_file_path = Column(Text, nullable=False)
     description = Column(Text)
+    weight_content_sha256 = Column(String(64), nullable=True)
+    weight_content_sha256_size = Column(BigInteger, nullable=True)
+    weight_content_sha256_mtime_ns = Column(BigInteger, nullable=True)
     upload_time = Column(DateTime, default=datetime.now)
     updated_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)

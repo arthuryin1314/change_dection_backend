@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import time
 from datetime import date, datetime
@@ -25,6 +26,10 @@ from router.image import image_lifecycle as workflow
 from router.image import images
 from router.image import upload_sessions
 from utils.get_user_by_token import get_current_user
+from utils.content_hash import ContentHash
+
+
+NEW_CONTENT_HASH = ContentHash("b" * 64, 10, 456)
 
 
 async def _override_db():
@@ -53,6 +58,9 @@ def _image(image_id: int = 1, image_name: str = "河流影像") -> SimpleNamespa
         image_type="多光谱",
         region_code="330100",
         img_path="uploads/images/river.tif",
+        content_sha256="a" * 64,
+        content_sha256_size=4,
+        content_sha256_mtime_ns=123,
         bbox=[120.0, 30.0, 121.0, 31.0],
         layer_name="river",
         wms_url="http://example.com/river",
@@ -341,6 +349,40 @@ def test_create_rejects_a_tif_whose_backend_md5_does_not_match():
         assert "MD5" in response.json()["detail"]
 
 
+def test_merge_tif_calculates_sha256_while_joining_chunks():
+    payload = b"first-chunksecondchunk"
+    with TemporaryDirectory(dir=Path("tests")) as temp_dir:
+        temp_root = Path(temp_dir)
+        image_dir = temp_root / "images"
+        image_dir.mkdir()
+        with (
+            patch.object(upload_sessions, "TMP_UPLOAD_DIR", temp_root),
+            patch.object(workflow, "IMAGE_DIR", image_dir),
+            patch.object(workflow, "get_tif_bbox_wgs84", return_value=[1, 2, 3, 4]),
+        ):
+            session = upload_sessions.begin_upload_session(
+                7,
+                file_name="river.tif",
+                file_size=len(payload),
+                chunk_size=len(b"first-chunk"),
+                total_chunks=2,
+                file_hash=hashlib.md5(payload).hexdigest(),
+            )
+            upload_id = session["upload_id"]
+            chunks = upload_sessions.session_dir(upload_id) / upload_sessions.CHUNKS_DIR_NAME
+            (chunks / "0.part").write_bytes(b"first-chunk")
+            (chunks / "1.part").write_bytes(b"secondchunk")
+            meta = upload_sessions.load_session(upload_id)
+
+            path, bbox, content_hash = workflow._merge_tif(upload_id, meta)
+
+        assert path.read_bytes() == payload
+        assert bbox == [1, 2, 3, 4]
+        assert content_hash.sha256 == hashlib.sha256(payload).hexdigest()
+        assert content_hash.size == len(payload)
+        assert content_hash.mtime_ns == path.stat().st_mtime_ns
+
+
 def test_missing_upload_session_returns_404_instead_of_500():
     with TemporaryDirectory(dir=Path("tests")) as temp_dir, patch.object(
         upload_sessions,
@@ -569,7 +611,7 @@ def test_edit_persists_old_resource_cleanup_before_commit():
             patch.object(
                 workflow,
                 "_merge_tif",
-                return_value=(Path("uploads/images/new.tif"), [1, 2, 3, 4]),
+                return_value=(Path("uploads/images/new.tif"), [1, 2, 3, 4], NEW_CONTENT_HASH),
             ),
             patch.object(workflow, "publish_geotiff_layer", new=AsyncMock(return_value="new-wms")),
             patch.object(workflow, "_remove_path") as remove_path,
@@ -590,6 +632,9 @@ def test_edit_persists_old_resource_cleanup_before_commit():
             ))
 
         db.commit.assert_awaited_once()
+        assert image.content_sha256 == NEW_CONTENT_HASH.sha256
+        assert image.content_sha256_size == NEW_CONTENT_HASH.size
+        assert image.content_sha256_mtime_ns == NEW_CONTENT_HASH.mtime_ns
         assert {call.args[0] for call in remove_path.call_args_list} == {
             "uploads/images/old.tif"
         }
@@ -628,7 +673,7 @@ def test_create_does_not_compensate_resources_after_commit_succeeds():
         ]
 
         with (
-            patch.object(workflow, "_merge_tif", return_value=(Path("new.tif"), [1, 2, 3, 4])),
+            patch.object(workflow, "_merge_tif", return_value=(Path("new.tif"), [1, 2, 3, 4], NEW_CONTENT_HASH)),
             patch.object(
                 workflow,
                 "_save_boundary_files",

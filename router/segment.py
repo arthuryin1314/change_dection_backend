@@ -61,9 +61,9 @@ class SegmentRequest(BaseModel):
     def validate_classes(cls, value: Optional[list[int]]) -> Optional[list[int]]:
         if value is None:
             return value
-        invalid = [class_id for class_id in value if class_id < 1 or class_id > 5]
+        invalid = [class_id for class_id in value if class_id < 0 or class_id > 5]
         if invalid:
-            raise ValueError(f"classes 中的类别 ID 必须在 1-5 之间，非法值：{invalid}")
+            raise ValueError(f"classes 中的类别 ID 必须在 0-5 之间，非法值：{invalid}")
         return list(dict.fromkeys(value))
 
     @field_validator("bbox")
@@ -143,6 +143,7 @@ async def segment_image(
                 payload.model_id,
                 model.weight_file_path,
                 payload.classes,
+                weight_sha256=model.weight_content_sha256,
             )
         except deeplab_service.ModelLoadError as exc:
             logger.warning(

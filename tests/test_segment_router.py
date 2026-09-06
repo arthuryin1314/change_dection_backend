@@ -43,6 +43,7 @@ def _model(
         model_type=model_type,
         framework=framework,
         weight_file_path=weight_file_path,
+        weight_content_sha256="b" * 64,
     )
 
 
@@ -143,6 +144,7 @@ def test_segment_endpoint_passes_classes_to_service():
     assert segment_rgba.call_args.args[1] == 11
     assert segment_rgba.call_args.args[2] == MODEL_WEIGHT_PATH
     assert segment_rgba.call_args.args[3] == [1, 2]
+    assert segment_rgba.call_args.kwargs["weight_sha256"] == "b" * 64
 
 
 def test_segment_endpoint_aligns_partial_overlap_to_full_bbox_canvas():
@@ -243,12 +245,25 @@ def test_segment_endpoint_rejects_invalid_classes():
             "width": 800,
             "height": 600,
             "srs": "EPSG:4326",
-            "classes": [0, 6],
+            "classes": [-1, 6],
         },
     )
 
     assert response.status_code == 422
-    assert "classes 中的类别 ID 必须在 1-5 之间" in response.text
+    assert "classes 中的类别 ID 必须在 0-5 之间" in response.text
+
+
+def test_segment_endpoint_accepts_background_class_zero():
+    request = segment.SegmentRequest(
+        image_id=1,
+        model_id=11,
+        bbox="116.3,39.8,116.5,40.0",
+        width=800,
+        height=600,
+        classes=[0, 1],
+    )
+
+    assert request.classes == [0, 1]
 
 
 def test_segment_endpoint_checks_current_user_image():

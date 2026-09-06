@@ -20,6 +20,9 @@ class Image(Base):
     bbox          = Column(JSON, nullable=True)
     layer_name    = Column(String(255), nullable=True)
     wms_url       = Column(Text, nullable=True)
+    content_sha256 = Column(String(64), nullable=True)
+    content_sha256_size = Column(BigInteger, nullable=True)
+    content_sha256_mtime_ns = Column(BigInteger, nullable=True)
     upload_time   = Column(DateTime, default=datetime.now)
 
     # 关联 boundary_files

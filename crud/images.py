@@ -19,6 +19,9 @@ async def create_image(
     bbox: Optional[List[float]] = None,
     layer_name: Optional[str] = None,
     wms_url: Optional[str] = None,
+    content_sha256: Optional[str] = None,
+    content_sha256_size: Optional[int] = None,
+    content_sha256_mtime_ns: Optional[int] = None,
 ) -> Image:
     """创建新的影像记录"""
     db_image = Image(
@@ -33,6 +36,9 @@ async def create_image(
         bbox=bbox,
         layer_name=layer_name,
         wms_url=wms_url,
+        content_sha256=content_sha256,
+        content_sha256_size=content_sha256_size,
+        content_sha256_mtime_ns=content_sha256_mtime_ns,
         upload_time=datetime.now()
     )
     db.add(db_image)

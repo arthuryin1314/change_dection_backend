@@ -15,6 +15,9 @@ async def create_ml_model(
     weight_file_path: str,
     model_file_path: str,
     description: str,
+    weight_content_sha256: str,
+    weight_content_sha256_size: int,
+    weight_content_sha256_mtime_ns: int,
 ) -> MLModel:
     """创建新的模型上传记录"""
     db_model = MLModel(
@@ -25,6 +28,9 @@ async def create_ml_model(
         weight_file_path=weight_file_path,
         model_file_path=model_file_path,
         description=description,
+        weight_content_sha256=weight_content_sha256,
+        weight_content_sha256_size=weight_content_sha256_size,
+        weight_content_sha256_mtime_ns=weight_content_sha256_mtime_ns,
     )
     db.add(db_model)
     await db.flush()
@@ -78,7 +84,7 @@ async def update_ml_model(
     db: AsyncSession,
     model_id: int,
     user_id: int,
-    **kwargs: str,
+    **kwargs: object,
 ) -> Optional[MLModel]:
     """局部更新当前用户的模型元数据"""
     record = await get_ml_model_by_id(db, model_id, user_id)

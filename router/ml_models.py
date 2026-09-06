@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ from schemas.ml_models import (
     MLModelResponse,
 )
 from utils.model_asset_storage import ModelAssetTooLargeError, save_upload_file
+from utils.content_hash import resolve_content_sha256
 from utils.get_user_by_token import get_current_user
 from utils.response import error_response, success_response
 
@@ -158,6 +160,7 @@ async def upload_model(
             current_user.id,
             MAX_MODEL_FILE_SIZE,
         )
+        weight_hash = await asyncio.to_thread(resolve_content_sha256, weight_path)
 
         db_record = await create_ml_model(
             db=db,
@@ -168,6 +171,9 @@ async def upload_model(
             weight_file_path=str(weight_path),
             model_file_path=str(model_file_path),
             description=description,
+            weight_content_sha256=weight_hash.sha256,
+            weight_content_sha256_size=weight_hash.size,
+            weight_content_sha256_mtime_ns=weight_hash.mtime_ns,
         )
         data = MLModelResponse.model_validate(db_record).model_dump(mode="json")
         await db.commit()
@@ -316,6 +322,10 @@ async def update_model(
                 MAX_WEIGHT_SIZE,
             )
             update_kwargs["weight_file_path"] = str(new_w_path)
+            weight_hash = await asyncio.to_thread(resolve_content_sha256, new_w_path)
+            update_kwargs["weight_content_sha256"] = weight_hash.sha256
+            update_kwargs["weight_content_sha256_size"] = weight_hash.size
+            update_kwargs["weight_content_sha256_mtime_ns"] = weight_hash.mtime_ns
 
         if model_file is not None:
             new_m_path = await save_upload_file(
