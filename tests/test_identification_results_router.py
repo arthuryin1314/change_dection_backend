@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 import io
 import os
 from datetime import datetime, timezone
@@ -6,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
+import pytest
 from affine import Affine
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/test")
@@ -20,8 +23,10 @@ from services.identification_results import (
     PROCESSING,
     SUCCEEDED,
     IdentificationResultRecord,
+    ResultIdentity,
     ResultClaim,
 )
+from utils.classification_contract import inference_parameters
 from utils.classification_storage import RasterGrid, write_classification_result
 from utils.get_user_by_token import get_current_user
 
@@ -30,12 +35,16 @@ class FakeDatabase:
     def __init__(self):
         self.committed = False
         self.flushed = False
+        self.rolled_back = False
 
     async def flush(self):
         self.flushed = True
 
     async def commit(self):
         self.committed = True
+
+    async def rollback(self):
+        self.rolled_back = True
 
 
 def _make_client(db=None):
@@ -220,6 +229,7 @@ def _stored_result(tmp_path, *, status=SUCCEEDED):
         status=status,
         started_at=datetime(2026, 9, 6, tzinfo=timezone.utc),
         completed_at=datetime(2026, 9, 6, tzinfo=timezone.utc),
+        lease_owner="worker",
         failure_detail=None,
         classes_path=str(stored.classes_path),
         valid_mask_path=str(stored.valid_mask_path),
@@ -229,7 +239,130 @@ def _stored_result(tmp_path, *, status=SUCCEEDED):
         raster_height=1,
         resolution=[0.01, 0.01],
         bounds=[110, 29.99, 110.02, 30],
+        class_area_m2=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        area_status="SUCCEEDED",
+        area_completed_at=datetime(2026, 9, 6, tzinfo=timezone.utc),
+        area_failure_detail=None,
     )
+
+
+def test_resolve_returns_complete_identity_match_without_writing_database(tmp_path):
+    client, db = _make_client()
+    image, model = _sources()
+    row = _stored_result(tmp_path)
+    matched = _claim(SUCCEEDED, False).record
+    lookup = AsyncMock(return_value=matched)
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results.SqlAlchemyClaimStore,
+        "get_by_identity",
+        new=lookup,
+    ), patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=AsyncMock(return_value=row),
+    ):
+        response = client.get(
+            "/api/identification-results/resolve",
+            params={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == "SUCCEEDED"
+    assert data["result"]["result_id"] == "result-1"
+    assert data["result"]["class_area_m2"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert db.flushed is False
+    assert db.committed is False
+
+
+def test_resolve_missing_identity_does_not_create_or_schedule_result():
+    client, db = _make_client()
+    image, model = _sources()
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results.SqlAlchemyClaimStore,
+        "get_by_identity",
+        new=AsyncMock(return_value=None),
+    ), patch.object(identification_results, "_schedule_generation") as scheduled:
+        response = client.get(
+            "/api/identification-results/resolve",
+            params={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"status": "MISSING"}
+    assert db.flushed is False
+    assert db.committed is False
+    scheduled.assert_not_called()
+
+
+def test_area_request_computes_saved_grid_and_commits_complete_summary(tmp_path):
+    client, db = _make_client()
+    row = _stored_result(tmp_path)
+    row.area_status = "NOT_COMPUTED"
+    row.class_area_m2 = None
+    saved = AsyncMock(return_value=True)
+
+    with patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=AsyncMock(return_value=row),
+    ), patch.object(
+        identification_results.crud_results,
+        "mark_area_succeeded",
+        new=saved,
+    ):
+        response = client.post("/api/identification-results/result-1/areas")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["result_id"] == "result-1"
+    assert data["area_status"] == "SUCCEEDED"
+    assert data["class_area_m2"] == pytest.approx(
+        [1069626.783188343, 1069626.783188343, 0, 0, 0, 0]
+    )
+    assert db.rolled_back is True
+    assert db.committed is True
+    assert saved.await_args.kwargs["lease_owner"] == "worker"
+    assert saved.await_args.kwargs["completed_at"] == row.completed_at
+
+
+def test_area_request_rejects_result_replaced_during_scan(tmp_path):
+    client, db = _make_client()
+    row = _stored_result(tmp_path)
+    row.area_status = "NOT_COMPUTED"
+    row.class_area_m2 = None
+
+    with patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=AsyncMock(return_value=row),
+    ), patch.object(
+        identification_results.crud_results,
+        "mark_area_succeeded",
+        new=AsyncMock(return_value=False),
+    ):
+        response = client.post("/api/identification-results/result-1/areas")
+
+    assert response.status_code == 409
+    assert db.committed is False
 
 
 def test_get_returns_persisted_spatial_contract_and_hides_other_users(tmp_path):
@@ -313,3 +446,187 @@ def test_render_rejects_failed_or_unready_result(tmp_path):
         )
 
     assert response.status_code == 409
+
+def test_resolve_unavailable_result_does_not_invalidate_or_write(tmp_path):
+    client, db = _make_client()
+    image, model = _sources()
+    row = _stored_result(tmp_path)
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results.SqlAlchemyClaimStore,
+        "get_by_identity",
+        new=AsyncMock(return_value=_claim(SUCCEEDED, False).record),
+    ), patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=AsyncMock(return_value=row),
+    ), patch.object(
+        identification_results,
+        "_row_is_reusable",
+        return_value=False,
+    ), patch.object(
+        identification_results.crud_results,
+        "invalidate_succeeded_result",
+        new=AsyncMock(),
+    ) as invalidate:
+        response = client.get(
+            "/api/identification-results/resolve",
+            params={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"status": "UNAVAILABLE"}
+    assert db.flushed is False
+    assert db.committed is False
+    invalidate.assert_not_awaited()
+
+
+def test_area_failure_is_persisted_without_invalidating_classification(tmp_path):
+    client, db = _make_client()
+    row = _stored_result(tmp_path)
+    row.area_status = "NOT_COMPUTED"
+    row.class_area_m2 = None
+    save_failure = AsyncMock(return_value=True)
+
+    with patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=AsyncMock(return_value=row),
+    ), patch.object(
+        identification_results,
+        "summarize_classification_area_m2",
+        side_effect=ValueError("有效掩膜损坏"),
+    ), patch.object(
+        identification_results.crud_results,
+        "mark_area_failed",
+        new=save_failure,
+    ), patch.object(
+        identification_results.crud_results,
+        "invalidate_succeeded_result",
+        new=AsyncMock(),
+    ) as invalidate:
+        response = client.post("/api/identification-results/result-1/areas")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "有效掩膜损坏"
+    assert db.rolled_back is True
+    assert db.committed is True
+    assert save_failure.await_args.kwargs["lease_owner"] == "worker"
+    assert save_failure.await_args.kwargs["completed_at"] == row.completed_at
+    invalidate.assert_not_awaited()
+    assert row.status == SUCCEEDED
+
+def test_reusability_validation_is_offloaded_from_async_request_loop():
+    row = SimpleNamespace(status=SUCCEEDED)
+    lookup = AsyncMock(return_value=row)
+    offload = AsyncMock(return_value=True)
+
+    with patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=lookup,
+    ), patch.object(
+        identification_results.asyncio,
+        "to_thread",
+        new=offload,
+    ):
+        reusable = asyncio.run(
+            identification_results.is_result_reusable(object(), "result-1", 7)
+        )
+
+    assert reusable is True
+    offload.assert_awaited_once_with(identification_results._row_is_reusable, row)
+
+def test_resolve_recomputes_changed_source_hash_without_persisting_cache(tmp_path):
+    client, db = _make_client()
+    image, model = _sources()
+    changed_source = tmp_path / "changed-source.tif"
+    changed_source.write_bytes(b"changed-image-content")
+    image.img_path = str(changed_source)
+    image.content_sha256_size = 0
+    lookup = AsyncMock(return_value=None)
+
+    expected_identity = ResultIdentity(
+        user_id=7,
+        image_content_sha256=hashlib.sha256(b"changed-image-content").hexdigest(),
+        weight_content_sha256="b" * 64,
+        inference_parameters=inference_parameters(),
+    ).sha256()
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results.SqlAlchemyClaimStore,
+        "get_by_identity",
+        new=lookup,
+    ):
+        response = client.get(
+            "/api/identification-results/resolve",
+            params={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"status": "MISSING"}
+    assert lookup.await_args.args == (7, expected_identity)
+    assert db.flushed is False
+    assert db.committed is False
+
+
+@pytest.mark.parametrize(
+    ("status", "failure_detail", "expected"),
+    (
+        (PROCESSING, None, {"status": PROCESSING}),
+        ("FAILED", "模型推理失败", {"status": "FAILED", "failure_detail": "模型推理失败"}),
+    ),
+)
+def test_resolve_exposes_matching_unready_status_without_writing(
+    tmp_path,
+    status,
+    failure_detail,
+    expected,
+):
+    client, db = _make_client()
+    image, model = _sources()
+    row = _stored_result(tmp_path, status=status)
+    row.failure_detail = failure_detail
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results.SqlAlchemyClaimStore,
+        "get_by_identity",
+        new=AsyncMock(return_value=_claim(status, False).record),
+    ), patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=AsyncMock(return_value=row),
+    ):
+        response = client.get(
+            "/api/identification-results/resolve",
+            params={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == expected
+    assert db.flushed is False
+    assert db.committed is False

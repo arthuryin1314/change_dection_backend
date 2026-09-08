@@ -1,7 +1,8 @@
 import asyncio
+from pathlib import Path
 from datetime import datetime, timezone
 
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint
 from sqlalchemy.dialects import postgresql
 
 from crud.identification_results import SqlAlchemyClaimStore
@@ -59,6 +60,35 @@ def test_source_foreign_keys_do_not_delete_content_results():
     assert {foreign_key.ondelete for foreign_key in model_fk} == {"SET NULL"}
 
 
+def test_area_columns_and_migration_share_the_same_storage_contract():
+    columns = ClassificationResult.__table__.columns
+    assert columns.class_area_m2.type.__class__.__name__ == "JSON"
+    assert columns.area_status.nullable is False
+    assert columns.area_completed_at.nullable is True
+    assert columns.area_failure_detail.nullable is True
+
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in ClassificationResult.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "NOT_COMPUTED" in constraints["ck_classification_results_area_status"]
+    assert "SUCCEEDED" in constraints["ck_classification_results_area_status"]
+    assert "FAILED" in constraints["ck_classification_results_area_status"]
+
+    migration = Path("migrations/002_classification_result_areas.sql").read_text(
+        encoding="utf-8"
+    )
+    for column_name in (
+        "class_area_m2",
+        "area_status",
+        "area_completed_at",
+        "area_failure_detail",
+    ):
+        assert column_name in migration
+    assert "conrelid = 'classification_results'::regclass" in migration
+
+
 def test_insert_claim_uses_postgresql_conflict_handling_instead_of_check_then_insert():
     session = RecordingSession(None)
     store = SqlAlchemyClaimStore(session, source_image_id=11, source_model_id=12)
@@ -103,4 +133,11 @@ def test_stale_takeover_is_one_conditional_update():
     assert "classification_results.status" in sql
     assert "classification_results.lease_expires_at" in sql
     assert "classification_results.lease_expires_at IS NULL" in sql
+    assert "class_area_m2" in sql
+    assert "area_status" in sql
+    assert "area_completed_at" in sql
+    assert "area_failure_detail" in sql
+    assert "NOT_COMPUTED" in session.statements[0].compile(
+        dialect=postgresql.dialect()
+    ).params.values()
     assert "RETURNING classification_results" in sql

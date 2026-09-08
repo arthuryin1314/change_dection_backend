@@ -179,6 +179,34 @@ def test_retry_replaces_a_corrupt_published_directory(tmp_path, monkeypatch):
     assert list(request.storage_root.glob(".result-1.*.corrupt")) == []
 
 
+def test_cleanup_failure_after_publish_keeps_generation_successful(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    source_path = tmp_path / "source.tif"
+    _write_source(source_path)
+    request = _request(tmp_path, source_path)
+    corrupt = request.storage_root / request.result_id
+    corrupt.mkdir(parents=True)
+    (corrupt / "classes.tif").write_bytes(b"truncated")
+    (corrupt / "valid_mask.tif").write_bytes(b"truncated")
+    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    original_rmtree = generation.shutil.rmtree
+
+    def fail_quarantine_cleanup(path):
+        if ".corrupt" in str(path):
+            raise PermissionError("file is open")
+        original_rmtree(path)
+
+    monkeypatch.setattr(generation.shutil, "rmtree", fail_quarantine_cleanup)
+
+    outcome = generation.generate_classification_files(request)
+
+    assert outcome.stored.classes_path.exists()
+    assert "旧识别结果隔离目录清理失败" in caplog.text
+
+
 def test_failed_rebuild_restores_quarantined_result(tmp_path, monkeypatch):
     source_path = tmp_path / "source.tif"
     _write_source(source_path)

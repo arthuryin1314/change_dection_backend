@@ -159,6 +159,23 @@ def _result_files(result_id: str):
         connection.close()
 
 
+def _result_area(result_id: str):
+    connection = psycopg2.connect(_database_url())
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT area_status, class_area_m2, area_completed_at, area_failure_detail
+                FROM classification_results
+                WHERE id = %s
+                """,
+                (result_id,),
+            )
+            return cursor.fetchone()
+    finally:
+        connection.close()
+
+
 def _wait_for_status(client: TestClient, result_id: str, expected: str):
     deadline = time.monotonic() + 10
     while True:
@@ -209,6 +226,38 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
             assert data["grid"]["width"] == 6
             assert data["grid"]["height"] == 5
             assert "4326" in data["grid"]["crs"]
+
+            resolved = client.get(
+                "/api/identification-results/resolve",
+                params={"image_id": image_id, "model_id": model_id},
+            )
+            assert resolved.status_code == 200
+            assert resolved.json()["data"]["status"] == "SUCCEEDED"
+            assert resolved.json()["data"]["result"]["result_id"] == result_id
+
+            calculated = client.post(
+                f"/api/identification-results/{result_id}/areas"
+            )
+            assert calculated.status_code == 200
+            area_data = calculated.json()["data"]
+            assert area_data["area_status"] == "SUCCEEDED"
+            assert area_data["class_area_m2"][0] == pytest.approx(
+                1069626.783188343,
+                rel=1e-10,
+                abs=1e-5,
+            )
+            assert area_data["class_area_m2"][1:5] == [0.0] * 4
+            assert area_data["class_area_m2"][5] > area_data["class_area_m2"][0]
+            persisted_area = _result_area(result_id)
+            assert persisted_area[0] == "SUCCEEDED"
+            assert persisted_area[1] == area_data["class_area_m2"]
+            assert persisted_area[2] is not None
+            assert persisted_area[3] is None
+
+            area_detail = client.get(f"/api/identification-results/{result_id}")
+            assert area_detail.json()["data"]["class_area_m2"] == area_data[
+                "class_area_m2"
+            ]
 
             status, classes_path, valid_mask_path = _result_files(result_id)
             assert status == "SUCCEEDED"

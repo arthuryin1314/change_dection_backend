@@ -109,6 +109,8 @@ def test_success_transition_writes_spatial_contract_in_same_update():
     assert "valid_mask_path" in sql
     assert "generation_metrics" in sql
     assert "SUCCEEDED" in params.values()
+    set_clause = sql.split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+    assert "lease_owner" not in set_clause
     assert session.commits == 1
 
 

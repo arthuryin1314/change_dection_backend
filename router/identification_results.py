@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,9 +25,14 @@ from services.identification_results import (
     claim_identification_result,
 )
 from utils.classification_render import RenderBoundsError, render_classification_png
+from utils.classification_result_lock import classification_result_lock
 from utils.classification_contract import inference_parameters, ordered_class_definitions
+from utils.classification_area import (
+    summarize_classification_area_m2,
+    validate_class_area_m2,
+)
 from utils.classification_storage import RasterGrid, StoredClassification, validate_stored_classification
-from utils.content_hash import resolve_content_sha256
+from utils.content_hash import ContentHash, resolve_content_sha256
 from utils.get_user_by_token import get_current_user
 
 
@@ -41,6 +47,14 @@ _generation_tasks: dict[str, set[asyncio.Task]] = {}
 class CreateIdentificationResultRequest(BaseModel):
     image_id: int = Field(..., gt=0)
     model_id: int = Field(..., gt=0)
+
+
+@dataclass(frozen=True)
+class ContentHashSource:
+    path: str
+    cached_sha256: str | None
+    cached_size: int | None
+    cached_mtime_ns: int | None
 
 
 def _response(status_code: int, message: str, data: dict) -> JSONResponse:
@@ -63,18 +77,38 @@ def _validate_sources(image, model) -> None:
         raise HTTPException(status_code=422, detail="模型不兼容")
 
 
-async def _resolve_source_hashes(db, image, model) -> tuple[str, str]:
-    image_hash, weight_hash = await asyncio.gather(
+async def _calculate_content_hashes(
+    image: ContentHashSource,
+    model: ContentHashSource,
+) -> tuple[ContentHash, ContentHash]:
+    return await asyncio.gather(
         asyncio.to_thread(
             resolve_content_sha256,
-            image.img_path,
+            image.path,
+            cached_sha256=image.cached_sha256,
+            cached_size=image.cached_size,
+            cached_mtime_ns=image.cached_mtime_ns,
+        ),
+        asyncio.to_thread(
+            resolve_content_sha256,
+            model.path,
+            cached_sha256=model.cached_sha256,
+            cached_size=model.cached_size,
+            cached_mtime_ns=model.cached_mtime_ns,
+        ),
+    )
+
+
+async def _resolve_source_hashes(db, image, model) -> tuple[str, str]:
+    image_hash, weight_hash = await _calculate_content_hashes(
+        ContentHashSource(
+            path=image.img_path,
             cached_sha256=image.content_sha256,
             cached_size=image.content_sha256_size,
             cached_mtime_ns=image.content_sha256_mtime_ns,
         ),
-        asyncio.to_thread(
-            resolve_content_sha256,
-            model.weight_file_path,
+        ContentHashSource(
+            path=model.weight_file_path,
             cached_sha256=model.weight_content_sha256,
             cached_size=model.weight_content_sha256_size,
             cached_mtime_ns=model.weight_content_sha256_mtime_ns,
@@ -148,12 +182,15 @@ def _row_is_reusable(row) -> bool:
     stored_grid = _stored_grid(row)
     if stored_grid is None:
         return False
-    return validate_stored_classification(*stored_grid, verify_pixels=False)
+    with classification_result_lock(stored_grid[0].directory):
+        return validate_stored_classification(*stored_grid, verify_pixels=False)
 
 
 async def is_result_reusable(db, result_id: str, user_id: int) -> bool:
     row = await crud_results.get_result_by_id(db, result_id, user_id)
-    return row is not None and row.status == SUCCEEDED and _row_is_reusable(row)
+    if row is None or row.status != SUCCEEDED:
+        return False
+    return await asyncio.to_thread(_row_is_reusable, row)
 
 
 @router.post("")
@@ -246,6 +283,10 @@ def _serialize_result(row) -> dict:
         "started_at": _iso(row.started_at),
         "completed_at": _iso(row.completed_at),
         "failure_detail": row.failure_detail,
+        "area_status": row.area_status,
+        "class_area_m2": row.class_area_m2,
+        "area_completed_at": _iso(row.area_completed_at),
+        "area_failure_detail": row.area_failure_detail,
     }
     if row.status == SUCCEEDED:
         data["grid"] = {
@@ -259,6 +300,171 @@ def _serialize_result(row) -> dict:
     return data
 
 
+@router.get("/resolve")
+async def resolve_identification_result(
+    image_id: int = Query(..., gt=0),
+    model_id: int = Query(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    image = await crud_images.get_image_by_id(db, image_id, current_user.id)
+    if image is None:
+        raise HTTPException(status_code=404, detail="影像不存在")
+    model = await crud_ml_models.get_ml_model_by_id(db, model_id, current_user.id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    _validate_sources(image, model)
+
+    image_source = ContentHashSource(
+        path=image.img_path,
+        cached_sha256=image.content_sha256,
+        cached_size=image.content_sha256_size,
+        cached_mtime_ns=image.content_sha256_mtime_ns,
+    )
+    model_source = ContentHashSource(
+        path=model.weight_file_path,
+        cached_sha256=model.weight_content_sha256,
+        cached_size=model.weight_content_sha256_size,
+        cached_mtime_ns=model.weight_content_sha256_mtime_ns,
+    )
+    source_image_id = image.id
+    source_model_id = model.id
+    await db.rollback()
+    image_hash, weight_hash = await _calculate_content_hashes(
+        image_source,
+        model_source,
+    )
+    identity = ResultIdentity(
+        user_id=current_user.id,
+        image_content_sha256=image_hash.sha256,
+        weight_content_sha256=weight_hash.sha256,
+        inference_parameters=inference_parameters(),
+    )
+    store = SqlAlchemyClaimStore(
+        db,
+        source_image_id=source_image_id,
+        source_model_id=source_model_id,
+    )
+    matched = await store.get_by_identity(current_user.id, identity.sha256())
+    if matched is None:
+        return _response(200, "未找到匹配的识别结果", {"status": "MISSING"})
+
+    row = await crud_results.get_result_by_id(db, matched.result_id, current_user.id)
+    if row is None:
+        return _response(200, "未找到匹配的识别结果", {"status": "MISSING"})
+    if row.status == PROCESSING:
+        return _response(200, "识别结果处理中", {"status": PROCESSING})
+    if row.status == "FAILED":
+        return _response(
+            200,
+            "识别结果失败",
+            {"status": "FAILED", "failure_detail": row.failure_detail},
+        )
+    if not await asyncio.to_thread(_row_is_reusable, row):
+        return _response(200, "识别结果文件不可用", {"status": "UNAVAILABLE"})
+    return _response(
+        200,
+        "查询成功",
+        {"status": SUCCEEDED, "result": _serialize_result(row)},
+    )
+
+
+def _serialize_area(result_id, status, values, completed_at, failure_detail=None):
+    return {
+        "result_id": result_id,
+        "area_status": status,
+        "class_area_m2": values,
+        "area_completed_at": _iso(completed_at),
+        "area_failure_detail": failure_detail,
+    }
+
+
+@router.post("/{result_id}/areas")
+async def calculate_identification_result_areas(
+    result_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    row = await crud_results.get_result_by_id(db, result_id, current_user.id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="识别结果不存在")
+    if row.status != SUCCEEDED:
+        raise HTTPException(status_code=409, detail="识别结果尚不可用")
+    if row.area_status == SUCCEEDED:
+        areas = validate_class_area_m2(row.class_area_m2)
+        return _response(
+            200,
+            "面积汇总已存在",
+            _serialize_area(
+                row.id,
+                SUCCEEDED,
+                areas,
+                row.area_completed_at,
+            ),
+        )
+    if (
+        row.classes_path is None
+        or row.valid_mask_path is None
+        or row.completed_at is None
+    ):
+        raise HTTPException(status_code=409, detail="识别结果文件尚不可用")
+
+    classes_path = row.classes_path
+    valid_mask_path = row.valid_mask_path
+    lease_owner = row.lease_owner
+    generation_completed_at = row.completed_at
+    await db.rollback()
+    try:
+        areas = await asyncio.to_thread(
+            summarize_classification_area_m2,
+            classes_path,
+            valid_mask_path,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        area_completed_at = _utc_now()
+        changed = await crud_results.mark_area_failed(
+            db,
+            result_id=result_id,
+            user_id=current_user.id,
+            lease_owner=lease_owner,
+            completed_at=generation_completed_at,
+            detail=str(exc),
+            area_completed_at=area_completed_at,
+        )
+        if not changed:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="识别结果已更新，请重新查询") from exc
+        await db.commit()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    area_completed_at = _utc_now()
+    changed = await crud_results.mark_area_succeeded(
+        db,
+        result_id=result_id,
+        user_id=current_user.id,
+        lease_owner=lease_owner,
+        completed_at=generation_completed_at,
+        class_area_m2=areas,
+        area_completed_at=area_completed_at,
+    )
+    if not changed:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="识别结果已更新，请重新查询")
+    await db.commit()
+    return _response(
+        200,
+        "面积统计完成",
+        _serialize_area(
+            result_id,
+            SUCCEEDED,
+            areas,
+            area_completed_at,
+        ),
+    )
+
+
 @router.get("/{result_id}")
 async def get_identification_result(
     result_id: str,
@@ -268,7 +474,7 @@ async def get_identification_result(
     row = await crud_results.get_result_by_id(db, result_id, current_user.id)
     if row is None:
         raise HTTPException(status_code=404, detail="识别结果不存在")
-    if row.status == SUCCEEDED and not _row_is_reusable(row):
+    if row.status == SUCCEEDED and not await asyncio.to_thread(_row_is_reusable, row):
         await crud_results.invalidate_succeeded_result(db, row.id, current_user.id)
         await db.commit()
         row.status = "FAILED"
@@ -295,19 +501,22 @@ async def render_identification_result(
     row = await crud_results.get_result_by_id(db, result_id, current_user.id)
     if row is None:
         raise HTTPException(status_code=404, detail="识别结果不存在")
-    if row.status != SUCCEEDED or not _row_is_reusable(row):
+    if row.status != SUCCEEDED or not await asyncio.to_thread(_row_is_reusable, row):
         raise HTTPException(status_code=409, detail="识别结果尚不可用")
     try:
-        image = await asyncio.to_thread(
-            render_classification_png,
-            row.classes_path,
-            row.valid_mask_path,
-            bbox=bbox,
-            width=width,
-            height=height,
-            srs=srs,
-            classes=selected,
-        )
+        def render_under_lock():
+            with classification_result_lock(Path(row.classes_path).parent):
+                return render_classification_png(
+                    row.classes_path,
+                    row.valid_mask_path,
+                    bbox=bbox,
+                    width=width,
+                    height=height,
+                    srs=srs,
+                    classes=selected,
+                )
+
+        image = await asyncio.to_thread(render_under_lock)
     except (RenderBoundsError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return Response(content=image, media_type="image/png")

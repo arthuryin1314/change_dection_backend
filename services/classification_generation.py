@@ -1,5 +1,6 @@
 import asyncio
 import ctypes
+import logging
 import os
 import shutil
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from utils.classification_storage import (
     StoredClassification,
     validate_stored_classification,
 )
+from utils.classification_result_lock import classification_result_lock
 from utils.deeplab_service import model_tile_predictor
 from utils.streaming_classification import (
     ClassificationGenerationCancelled,
@@ -27,6 +29,7 @@ from utils.streaming_classification import (
 
 
 HEARTBEAT_INTERVAL_SECONDS = 60
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -135,7 +138,7 @@ def _metadata(dataset) -> SpatialMetadata:
     )
 
 
-def generate_classification_files(
+def _generate_classification_files_unlocked(
     request: GenerationRequest,
     *,
     progress_callback: Callable[[StreamingMetrics], None] | None = None,
@@ -227,22 +230,54 @@ def generate_classification_files(
         except BaseException:
             if quarantine is not None and quarantine.exists():
                 if final_directory.exists():
-                    shutil.rmtree(quarantine)
+                    _remove_quarantine_best_effort(quarantine)
                 else:
                     try:
                         quarantine.replace(final_directory)
-                    except FileExistsError:
-                        shutil.rmtree(quarantine)
+                    except OSError:
+                        logger.warning(
+                            "旧识别结果隔离目录恢复失败: %s",
+                            quarantine,
+                            exc_info=True,
+                        )
             raise
         else:
             if quarantine is not None and quarantine.exists():
-                shutil.rmtree(quarantine)
+                _remove_quarantine_best_effort(quarantine)
 
     metrics.total_seconds = perf_counter() - total_started
     metrics.peak_rss_bytes = _peak_rss_bytes()
     if torch.cuda.is_available():
         metrics.peak_gpu_bytes = torch.cuda.max_memory_allocated()
     return GenerationOutcome(stored, metadata, metrics)
+
+
+def _remove_quarantine_best_effort(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        logger.warning(
+            "旧识别结果隔离目录清理失败: %s",
+            path,
+            exc_info=True,
+        )
+
+
+def generate_classification_files(
+    request: GenerationRequest,
+    *,
+    progress_callback: Callable[[StreamingMetrics], None] | None = None,
+    cancellation_event: Event | None = None,
+    publication_guard: Callable[[], None] | None = None,
+) -> GenerationOutcome:
+    result_directory = Path(request.storage_root) / request.result_id
+    with classification_result_lock(result_directory):
+        return _generate_classification_files_unlocked(
+            request,
+            progress_callback=progress_callback,
+            cancellation_event=cancellation_event,
+            publication_guard=publication_guard,
+        )
 
 
 async def _heartbeat_loop(lifecycle: GenerationLifecycle) -> None:

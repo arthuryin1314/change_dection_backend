@@ -29,6 +29,10 @@ class ClassificationResult(Base):
             "status IN ('PROCESSING', 'SUCCEEDED', 'FAILED')",
             name="ck_classification_results_status",
         ),
+        CheckConstraint(
+            "area_status IN ('NOT_COMPUTED', 'SUCCEEDED', 'FAILED')",
+            name="ck_classification_results_area_status",
+        ),
         Index("ix_classification_results_user_status", "user_id", "status"),
     )
 
@@ -71,6 +75,15 @@ class ClassificationResult(Base):
     resolution = Column(JSON, nullable=True)
     bounds = Column(JSON, nullable=True)
     generation_metrics = Column(JSON, nullable=True)
+    class_area_m2 = Column(JSON, nullable=True)
+    area_status = Column(
+        String(16),
+        nullable=False,
+        default="NOT_COMPUTED",
+        server_default="NOT_COMPUTED",
+    )
+    area_completed_at = Column(DateTime(timezone=True), nullable=True)
+    area_failure_detail = Column(Text, nullable=True)
     created_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

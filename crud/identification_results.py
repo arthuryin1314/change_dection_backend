@@ -117,6 +117,10 @@ class SqlAlchemyClaimStore:
                 lease_expires_at=lease.expires_at,
                 completed_at=None,
                 failure_detail=None,
+                class_area_m2=None,
+                area_status="NOT_COMPUTED",
+                area_completed_at=None,
+                area_failure_detail=None,
             )
             .returning(ClassificationResult)
         )
