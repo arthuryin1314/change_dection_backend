@@ -1,5 +1,6 @@
 from functools import lru_cache
 from math import pi
+from typing import Literal
 
 import numpy as np
 from affine import Affine
@@ -153,37 +154,61 @@ def pixel_area_m2(
     grid_shape: tuple[int, int],
     window: Window | None = None,
 ) -> np.ndarray:
-    spatial_ref = CRS.from_user_input(crs)
     row_slice, column_slice = _window_slices(grid_shape, window)
     result_height = row_slice.stop - row_slice.start
     result_width = column_slice.stop - column_slice.start
     if result_height * result_width > MAX_MATERIALIZED_AREA_CELLS:
         raise UnsupportedAreaGridError("大面积网格必须使用窗口分块调用")
-    height, width = grid_shape
-    transform_values = _transform_key(transform)
-
-    if spatial_ref.is_projected:
-        columns = _projected_column_areas(
-            spatial_ref.to_wkt(),
-            transform_values,
-            height,
-            width,
-        )[column_slice]
+    axis, areas = pixel_area_axis_m2(crs, transform, grid_shape)
+    if axis == "column":
+        columns = areas[column_slice]
         result = np.broadcast_to(
             columns[np.newaxis, :],
             (result_height, columns.size),
         )
-    elif spatial_ref.is_geographic:
-        rows = _geographic_row_areas(
-            spatial_ref.to_wkt(),
-            transform_values,
-            height,
-            width,
-        )[row_slice]
+    else:
+        rows = areas[row_slice]
         result = np.broadcast_to(
             rows[:, np.newaxis],
             (rows.size, result_width),
         )
-    else:
-        raise UnsupportedAreaGridError("CRS 必须是投影坐标系或经纬度坐标系")
     return np.array(result, dtype=np.float64, copy=True)
+
+
+def pixel_area_axis_m2(
+    crs: str | CRS,
+    transform: Affine,
+    grid_shape: tuple[int, int],
+) -> tuple[Literal["column", "row"], np.ndarray]:
+    """Return the index axis and per-position surface area in square metres.
+
+    ``column`` means values are indexed by column and remain constant down each
+    column. ``row`` means values are indexed by row and remain constant across
+    each row.
+    """
+    height, width = grid_shape
+    if height <= 0 or width <= 0:
+        raise ValueError("grid_shape 必须为正整数")
+    spatial_ref = CRS.from_user_input(crs)
+    transform_values = _transform_key(transform)
+    if spatial_ref.is_projected:
+        return (
+            "column",
+            _projected_column_areas(
+                spatial_ref.to_wkt(),
+                transform_values,
+                height,
+                width,
+            ),
+        )
+    if spatial_ref.is_geographic:
+        return (
+            "row",
+            _geographic_row_areas(
+                spatial_ref.to_wkt(),
+                transform_values,
+                height,
+                width,
+            ),
+        )
+    raise UnsupportedAreaGridError("CRS 必须是投影坐标系或经纬度坐标系")

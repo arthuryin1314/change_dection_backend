@@ -4,7 +4,11 @@ from affine import Affine
 from rasterio.crs import CRS as RasterioCRS
 from rasterio.windows import Window
 
-from utils.pixel_area import UnsupportedAreaGridError, pixel_area_m2
+from utils.pixel_area import (
+    UnsupportedAreaGridError,
+    pixel_area_axis_m2,
+    pixel_area_m2,
+)
 
 
 def test_projected_pixel_matches_fixed_geographiclib_corner_reference():
@@ -46,6 +50,32 @@ def test_window_is_an_exact_slice_of_whole_raster_cache():
     )
 
     assert np.array_equal(window, whole[1:3, 2:5])
+
+
+def test_projected_axis_contract_indexes_columns_and_matches_2d_result():
+    transform = Affine(0.8, 0, 40558753.6, 0, -0.8, 3571463.2)
+
+    axis, areas = pixel_area_axis_m2("EPSG:4528", transform, (4, 6))
+
+    assert axis == "column"
+    assert areas.shape == (6,)
+    assert np.array_equal(
+        pixel_area_m2("EPSG:4528", transform, (4, 6)),
+        np.broadcast_to(areas[np.newaxis, :], (4, 6)),
+    )
+
+
+def test_geographic_axis_contract_indexes_rows_and_matches_2d_result():
+    transform = Affine(0.01, 0, 110, 0, -0.01, 30)
+
+    axis, areas = pixel_area_axis_m2("EPSG:4326", transform, (4, 6))
+
+    assert axis == "row"
+    assert areas.shape == (4,)
+    assert np.array_equal(
+        pixel_area_m2("EPSG:4326", transform, (4, 6)),
+        np.broadcast_to(areas[:, np.newaxis], (4, 6)),
+    )
 
 
 def test_projected_grid_broadcasts_columns_and_geographic_grid_broadcasts_rows():
