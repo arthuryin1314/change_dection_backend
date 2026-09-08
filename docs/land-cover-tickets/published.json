@@ -1,0 +1,45 @@
+{
+  "1b": {
+    "number": 8,
+    "file": "01b-area-display.md",
+    "title": "1b：六类面积统计与统一单位展示",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/8"
+  },
+  "3": {
+    "number": 13,
+    "file": "03-grid-alignment.md",
+    "title": "3：不同坐标系与分辨率的影像自动对齐后分析",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/13"
+  },
+  "4a": {
+    "number": 10,
+    "file": "04a-reuse.md",
+    "title": "4a：按版本身份复用两期识别结果",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/10",
+    "status": "merged-into-9"
+  },
+  "4b": {
+    "number": 11,
+    "file": "04-auto-identification.md",
+    "title": "4b：自动补算编排、状态查询与失败重试",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/11"
+  },
+  "2": {
+    "number": 9,
+    "file": "02-matrix.md",
+    "title": "2：两期识别结果齐备后计算、展示并保存转移矩阵",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/9"
+  },
+  "5": {
+    "number": 12,
+    "file": "05-history.md",
+    "title": "5：识别与变化检测历史列表及结果查看",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/12"
+  },
+  "1a": {
+    "number": 7,
+    "file": "01-single-period.md",
+    "title": "1a：分类结果契约与共享像元地表面积能力",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/7"
+  }
+}
