@@ -235,11 +235,14 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
             assert resolved.json()["data"]["status"] == "SUCCEEDED"
             assert resolved.json()["data"]["result"]["result_id"] == result_id
 
+            identity_sha256 = resolved.json()["data"]["result"]["identity_sha256"]
             calculated = client.post(
-                f"/api/identification-results/{result_id}/areas"
+                f"/api/identification-results/{result_id}/areas",
+                params={"identity_sha256": identity_sha256},
             )
             assert calculated.status_code == 200
             area_data = calculated.json()["data"]
+            assert area_data["identity_sha256"] == identity_sha256
             assert area_data["area_status"] == "SUCCEEDED"
             assert area_data["class_area_m2"][0] == pytest.approx(
                 1069626.783188343,

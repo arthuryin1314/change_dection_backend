@@ -307,10 +307,11 @@ async def resolve_identification_result(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    image = await crud_images.get_image_by_id(db, image_id, current_user.id)
+    user_id = current_user.id
+    image = await crud_images.get_image_by_id(db, image_id, user_id)
     if image is None:
         raise HTTPException(status_code=404, detail="影像不存在")
-    model = await crud_ml_models.get_ml_model_by_id(db, model_id, current_user.id)
+    model = await crud_ml_models.get_ml_model_by_id(db, model_id, user_id)
     if model is None:
         raise HTTPException(status_code=404, detail="模型不存在")
     _validate_sources(image, model)
@@ -335,7 +336,7 @@ async def resolve_identification_result(
         model_source,
     )
     identity = ResultIdentity(
-        user_id=current_user.id,
+        user_id=user_id,
         image_content_sha256=image_hash.sha256,
         weight_content_sha256=weight_hash.sha256,
         inference_parameters=inference_parameters(),
@@ -345,11 +346,11 @@ async def resolve_identification_result(
         source_image_id=source_image_id,
         source_model_id=source_model_id,
     )
-    matched = await store.get_by_identity(current_user.id, identity.sha256())
+    matched = await store.get_by_identity(user_id, identity.sha256())
     if matched is None:
         return _response(200, "未找到匹配的识别结果", {"status": "MISSING"})
 
-    row = await crud_results.get_result_by_id(db, matched.result_id, current_user.id)
+    row = await crud_results.get_result_by_id(db, matched.result_id, user_id)
     if row is None:
         return _response(200, "未找到匹配的识别结果", {"status": "MISSING"})
     if row.status == PROCESSING:
@@ -369,9 +370,17 @@ async def resolve_identification_result(
     )
 
 
-def _serialize_area(result_id, status, values, completed_at, failure_detail=None):
+def _serialize_area(
+    result_id,
+    identity_sha256,
+    status,
+    values,
+    completed_at,
+    failure_detail=None,
+):
     return {
         "result_id": result_id,
+        "identity_sha256": identity_sha256,
         "area_status": status,
         "class_area_m2": values,
         "area_completed_at": _iso(completed_at),
@@ -382,12 +391,21 @@ def _serialize_area(result_id, status, values, completed_at, failure_detail=None
 @router.post("/{result_id}/areas")
 async def calculate_identification_result_areas(
     result_id: str,
+    identity_sha256: str = Query(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    row = await crud_results.get_result_by_id(db, result_id, current_user.id)
+    user_id = current_user.id
+    row = await crud_results.get_result_by_id(db, result_id, user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="识别结果不存在")
+    if row.identity_sha256 != identity_sha256:
+        raise HTTPException(status_code=409, detail="识别结果身份已更新，请重新查询")
     if row.status != SUCCEEDED:
         raise HTTPException(status_code=409, detail="识别结果尚不可用")
     if row.area_status == SUCCEEDED:
@@ -397,6 +415,7 @@ async def calculate_identification_result_areas(
             "面积汇总已存在",
             _serialize_area(
                 row.id,
+                identity_sha256,
                 SUCCEEDED,
                 areas,
                 row.area_completed_at,
@@ -427,7 +446,7 @@ async def calculate_identification_result_areas(
         changed = await crud_results.mark_area_failed(
             db,
             result_id=result_id,
-            user_id=current_user.id,
+            user_id=user_id,
             lease_owner=lease_owner,
             completed_at=generation_completed_at,
             detail=str(exc),
@@ -443,7 +462,7 @@ async def calculate_identification_result_areas(
     changed = await crud_results.mark_area_succeeded(
         db,
         result_id=result_id,
-        user_id=current_user.id,
+        user_id=user_id,
         lease_owner=lease_owner,
         completed_at=generation_completed_at,
         class_area_m2=areas,
@@ -458,6 +477,7 @@ async def calculate_identification_result_areas(
         "面积统计完成",
         _serialize_area(
             result_id,
+            identity_sha256,
             SUCCEEDED,
             areas,
             area_completed_at,

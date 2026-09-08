@@ -47,8 +47,9 @@ class FakeDatabase:
         self.rolled_back = True
 
 
-def _make_client(db=None):
+def _make_client(db=None, current_user=None):
     database = db or FakeDatabase()
+    user = current_user if current_user is not None else SimpleNamespace(id=7)
 
     async def override_db():
         yield database
@@ -56,8 +57,19 @@ def _make_client(db=None):
     app = FastAPI()
     app.include_router(identification_results.router)
     app.dependency_overrides[get_db] = override_db
-    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=7)
+    app.dependency_overrides[get_current_user] = lambda: user
     return TestClient(app), database
+
+
+class ExpiringCurrentUser:
+    def __init__(self, db):
+        self.db = db
+
+    @property
+    def id(self):
+        if self.db.rolled_back:
+            raise RuntimeError("current_user was accessed after rollback")
+        return 7
 
 
 def _sources():
@@ -313,8 +325,36 @@ def test_resolve_missing_identity_does_not_create_or_schedule_result():
     scheduled.assert_not_called()
 
 
+def test_resolve_snapshots_current_user_before_releasing_read_transaction():
+    db = FakeDatabase()
+    client, _ = _make_client(db, ExpiringCurrentUser(db))
+    image, model = _sources()
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results.SqlAlchemyClaimStore,
+        "get_by_identity",
+        new=AsyncMock(return_value=None),
+    ):
+        response = client.get(
+            "/api/identification-results/resolve",
+            params={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"status": "MISSING"}
+
+
 def test_area_request_computes_saved_grid_and_commits_complete_summary(tmp_path):
-    client, db = _make_client()
+    db = FakeDatabase()
+    client, _ = _make_client(db, ExpiringCurrentUser(db))
     row = _stored_result(tmp_path)
     row.area_status = "NOT_COMPUTED"
     row.class_area_m2 = None
@@ -329,11 +369,15 @@ def test_area_request_computes_saved_grid_and_commits_complete_summary(tmp_path)
         "mark_area_succeeded",
         new=saved,
     ):
-        response = client.post("/api/identification-results/result-1/areas")
+        response = client.post(
+            "/api/identification-results/result-1/areas",
+            params={"identity_sha256": "c" * 64},
+        )
 
     assert response.status_code == 200
     data = response.json()["data"]
     assert data["result_id"] == "result-1"
+    assert data["identity_sha256"] == "c" * 64
     assert data["area_status"] == "SUCCEEDED"
     assert data["class_area_m2"] == pytest.approx(
         [1069626.783188343, 1069626.783188343, 0, 0, 0, 0]
@@ -359,7 +403,10 @@ def test_area_request_rejects_result_replaced_during_scan(tmp_path):
         "mark_area_succeeded",
         new=AsyncMock(return_value=False),
     ):
-        response = client.post("/api/identification-results/result-1/areas")
+        response = client.post(
+            "/api/identification-results/result-1/areas",
+            params={"identity_sha256": "c" * 64},
+        )
 
     assert response.status_code == 409
     assert db.committed is False
@@ -513,7 +560,10 @@ def test_area_failure_is_persisted_without_invalidating_classification(tmp_path)
         "invalidate_succeeded_result",
         new=AsyncMock(),
     ) as invalidate:
-        response = client.post("/api/identification-results/result-1/areas")
+        response = client.post(
+            "/api/identification-results/result-1/areas",
+            params={"identity_sha256": "c" * 64},
+        )
 
     assert response.status_code == 422
     assert response.json()["detail"] == "有效掩膜损坏"
@@ -523,6 +573,31 @@ def test_area_failure_is_persisted_without_invalidating_classification(tmp_path)
     assert save_failure.await_args.kwargs["completed_at"] == row.completed_at
     invalidate.assert_not_awaited()
     assert row.status == SUCCEEDED
+
+
+def test_area_request_rejects_stale_identity_before_scanning(tmp_path):
+    client, db = _make_client()
+    row = _stored_result(tmp_path)
+    row.area_status = "NOT_COMPUTED"
+    row.class_area_m2 = None
+
+    with patch.object(
+        identification_results.crud_results,
+        "get_result_by_id",
+        new=AsyncMock(return_value=row),
+    ), patch.object(
+        identification_results,
+        "summarize_classification_area_m2",
+    ) as summarize:
+        response = client.post(
+            "/api/identification-results/result-1/areas",
+            params={"identity_sha256": "d" * 64},
+        )
+
+    assert response.status_code == 409
+    assert db.rolled_back is False
+    summarize.assert_not_called()
+
 
 def test_reusability_validation_is_offloaded_from_async_request_loop():
     row = SimpleNamespace(status=SUCCEEDED)
