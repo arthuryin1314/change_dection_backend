@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from affine import Affine
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +33,7 @@ from utils.classification_area import (
 from utils.classification_storage import RasterGrid, StoredClassification, validate_stored_classification
 from utils.content_hash import ContentHash, resolve_content_sha256
 from utils.get_user_by_token import get_current_user
+from utils.response import api_response
 
 
 router = APIRouter(prefix="/api/identification-results", tags=["identification-results"])
@@ -57,11 +57,11 @@ class ContentHashSource:
     cached_mtime_ns: int | None
 
 
-def _response(status_code: int, message: str, data: dict) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"code": status_code, "message": message, "data": data},
-    )
+@dataclass(frozen=True)
+class IdentificationResolution:
+    status: str
+    row: object | None = None
+    reason: str | None = None
 
 
 def _validate_sources(image, model) -> None:
@@ -178,11 +178,14 @@ def _stored_grid(row) -> tuple[StoredClassification, RasterGrid] | None:
     )
 
 
-def _row_is_reusable(row) -> bool:
+def _row_is_reusable(row, *, timeout_seconds: float = 2) -> bool:
     stored_grid = _stored_grid(row)
     if stored_grid is None:
         return False
-    with classification_result_lock(stored_grid[0].directory):
+    with classification_result_lock(
+        stored_grid[0].directory,
+        timeout_seconds=timeout_seconds,
+    ):
         return validate_stored_classification(*stored_grid, verify_pixels=False)
 
 
@@ -225,7 +228,7 @@ async def create_identification_result(
 
     if claim.record.status == SUCCEEDED:
         if await is_result_reusable(db, claim.record.result_id, current_user.id):
-            return _response(
+            return api_response(
                 200,
                 "识别结果已存在",
                 {"result_id": claim.record.result_id, "status": SUCCEEDED},
@@ -249,7 +252,7 @@ async def create_identification_result(
         )
         _schedule_generation(request, lease_owner)
 
-    return _response(
+    return api_response(
         202,
         "识别结果生成中",
         {"result_id": claim.record.result_id, "status": PROCESSING},
@@ -300,14 +303,13 @@ def _serialize_result(row) -> dict:
     return data
 
 
-@router.get("/resolve")
-async def resolve_identification_result(
-    image_id: int = Query(..., gt=0),
-    model_id: int = Query(..., gt=0),
-    db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    user_id = current_user.id
+async def resolve_identification_for_change(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    image_id: int,
+    model_id: int,
+) -> IdentificationResolution:
     image = await crud_images.get_image_by_id(db, image_id, user_id)
     if image is None:
         raise HTTPException(status_code=404, detail="影像不存在")
@@ -348,27 +350,60 @@ async def resolve_identification_result(
     )
     matched = await store.get_by_identity(user_id, identity.sha256())
     if matched is None:
-        return _response(200, "未找到匹配的识别结果", {"status": "MISSING"})
+        previous = await crud_results.get_latest_by_sources(
+            db,
+            user_id,
+            source_image_id,
+            source_model_id,
+        )
+        reason = "VERSION_MISMATCH" if previous is not None else "MISSING"
+        return IdentificationResolution(status="MISSING", reason=reason)
 
     row = await crud_results.get_result_by_id(db, matched.result_id, user_id)
     if row is None:
-        return _response(200, "未找到匹配的识别结果", {"status": "MISSING"})
+        return IdentificationResolution(status="MISSING", reason="MISSING")
     if row.status == PROCESSING:
-        return _response(200, "识别结果处理中", {"status": PROCESSING})
+        return IdentificationResolution(status=PROCESSING, row=row, reason=PROCESSING)
     if row.status == "FAILED":
-        return _response(
+        return IdentificationResolution(status="FAILED", row=row, reason=row.failure_detail)
+    if not await asyncio.to_thread(_row_is_reusable, row):
+        return IdentificationResolution(status="UNAVAILABLE", row=row, reason="UNAVAILABLE")
+    return IdentificationResolution(status=SUCCEEDED, row=row)
+
+
+@router.get("/resolve")
+async def resolve_identification_result(
+    image_id: int = Query(..., gt=0),
+    model_id: int = Query(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    try:
+        resolution = await resolve_identification_for_change(
+            db,
+            user_id=current_user.id,
+            image_id=image_id,
+            model_id=model_id,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if resolution.status == "MISSING":
+        return api_response(200, "未找到匹配的识别结果", {"status": "MISSING"})
+    if resolution.status == PROCESSING:
+        return api_response(200, "识别结果处理中", {"status": PROCESSING})
+    if resolution.status == "FAILED":
+        return api_response(
             200,
             "识别结果失败",
-            {"status": "FAILED", "failure_detail": row.failure_detail},
+            {"status": "FAILED", "failure_detail": resolution.reason},
         )
-    if not await asyncio.to_thread(_row_is_reusable, row):
-        return _response(200, "识别结果文件不可用", {"status": "UNAVAILABLE"})
-    return _response(
+    if resolution.status == "UNAVAILABLE":
+        return api_response(200, "识别结果文件不可用", {"status": "UNAVAILABLE"})
+    return api_response(
         200,
         "查询成功",
-        {"status": SUCCEEDED, "result": _serialize_result(row)},
+        {"status": SUCCEEDED, "result": _serialize_result(resolution.row)},
     )
-
 
 def _serialize_area(
     result_id,
@@ -410,7 +445,7 @@ async def calculate_identification_result_areas(
         raise HTTPException(status_code=409, detail="识别结果尚不可用")
     if row.area_status == SUCCEEDED:
         areas = validate_class_area_m2(row.class_area_m2)
-        return _response(
+        return api_response(
             200,
             "面积汇总已存在",
             _serialize_area(
@@ -472,7 +507,7 @@ async def calculate_identification_result_areas(
         await db.rollback()
         raise HTTPException(status_code=409, detail="识别结果已更新，请重新查询")
     await db.commit()
-    return _response(
+    return api_response(
         200,
         "面积统计完成",
         _serialize_area(
@@ -499,7 +534,7 @@ async def get_identification_result(
         await db.commit()
         row.status = "FAILED"
         row.failure_detail = "识别结果文件缺失或损坏"
-    return _response(200, "查询成功", _serialize_result(row))
+    return api_response(200, "查询成功", _serialize_result(row))
 
 
 @router.get("/{result_id}/render")

@@ -312,6 +312,10 @@ def test_resolve_missing_identity_does_not_create_or_schedule_result():
         identification_results.SqlAlchemyClaimStore,
         "get_by_identity",
         new=AsyncMock(return_value=None),
+    ), patch.object(
+        identification_results.crud_results,
+        "get_latest_by_sources",
+        new=AsyncMock(return_value=None),
     ), patch.object(identification_results, "_schedule_generation") as scheduled:
         response = client.get(
             "/api/identification-results/resolve",
@@ -341,6 +345,10 @@ def test_resolve_snapshots_current_user_before_releasing_read_transaction():
     ), patch.object(
         identification_results.SqlAlchemyClaimStore,
         "get_by_identity",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
+        identification_results.crud_results,
+        "get_latest_by_sources",
         new=AsyncMock(return_value=None),
     ):
         response = client.get(
@@ -648,6 +656,10 @@ def test_resolve_recomputes_changed_source_hash_without_persisting_cache(tmp_pat
         identification_results.SqlAlchemyClaimStore,
         "get_by_identity",
         new=lookup,
+    ), patch.object(
+        identification_results.crud_results,
+        "get_latest_by_sources",
+        new=AsyncMock(return_value=None),
     ):
         response = client.get(
             "/api/identification-results/resolve",
@@ -705,3 +717,54 @@ def test_resolve_exposes_matching_unready_status_without_writing(
     assert response.json()["data"] == expected
     assert db.flushed is False
     assert db.committed is False
+
+
+def test_change_resolver_distinguishes_previous_source_version():
+    image, model = _sources()
+    db = FakeDatabase()
+    old = SimpleNamespace(id="old-version")
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results.SqlAlchemyClaimStore,
+        "get_by_identity",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
+        identification_results.crud_results,
+        "get_latest_by_sources",
+        new=AsyncMock(return_value=old),
+    ):
+        resolution = asyncio.run(
+            identification_results.resolve_identification_for_change(
+                db,
+                user_id=7,
+                image_id=1,
+                model_id=11,
+            )
+        )
+
+    assert resolution.status == "MISSING"
+    assert resolution.reason == "VERSION_MISMATCH"
+
+
+def test_resolve_maps_busy_result_lock_to_retryable_409():
+    client, _ = _make_client()
+    with patch.object(
+        identification_results,
+        "resolve_identification_for_change",
+        new=AsyncMock(side_effect=TimeoutError("等待识别结果文件锁超时")),
+    ):
+        response = client.get(
+            "/api/identification-results/resolve",
+            params={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "等待识别结果文件锁超时"

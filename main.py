@@ -9,6 +9,7 @@ from config.db_config import AsyncSessionLocal, async_engine
 from models.Base import Base
 from models import ml_models as ml_model_metadata
 from models import classification_results as classification_result_metadata
+from models import change_results as change_result_metadata
 from router import users
 from utils.exception_handler import register_exception_handlers
 from router.image import images
@@ -17,6 +18,8 @@ from router.image import upload_sessions
 from router import segment
 from router import ml_models
 from router import identification_results
+from router import change_results
+from crud import change_results as change_result_crud
 from services.generation_lifecycle import recover_expired_processing_results
 from datetime import datetime, timezone
 
@@ -30,6 +33,9 @@ async def lifespan(app: FastAPI):
         AsyncSessionLocal,
         now=datetime.now(timezone.utc),
     )
+    async with AsyncSessionLocal() as db:
+        await change_result_crud.expire_stale(db, now=datetime.now(timezone.utc))
+        await db.commit()
     await image_lifecycle.recover_cleanup_operations(AsyncSessionLocal)
     upload_sessions.start_tmp_cleanup_task()
     image_lifecycle.start_cleanup_task()
@@ -55,4 +61,5 @@ app.include_router(images.router)
 app.include_router(segment.router)
 app.include_router(ml_models.router)
 app.include_router(identification_results.router)
+app.include_router(change_results.router)
 register_exception_handlers(app)

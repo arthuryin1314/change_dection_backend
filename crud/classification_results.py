@@ -22,6 +22,25 @@ async def get_result_by_id(
     return result.scalar_one_or_none()
 
 
+async def get_latest_by_sources(
+    db: AsyncSession,
+    user_id: int,
+    source_image_id: int,
+    source_model_id: int,
+) -> ClassificationResult | None:
+    result = await db.execute(
+        select(ClassificationResult)
+        .where(
+            ClassificationResult.user_id == user_id,
+            ClassificationResult.source_image_id == source_image_id,
+            ClassificationResult.source_model_id == source_model_id,
+        )
+        .order_by(ClassificationResult.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def invalidate_succeeded_result(
     db: AsyncSession,
     result_id: str,
