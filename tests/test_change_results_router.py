@@ -1,9 +1,14 @@
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import numpy as np
 import pytest
+import rasterio
+from affine import Affine
+from pyproj import Transformer
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/test")
 
@@ -15,6 +20,12 @@ from router import change_results
 from utils.classification_storage import RasterGrid
 from utils.get_user_by_token import get_current_user
 from utils.transition_matrix import TransitionMatrixError, TransitionMatrixResult
+
+
+LOCAL_CRS_WKT = (
+    'LOCAL_CS["arbitrary",LOCAL_DATUM["unknown",0],UNIT["metre",1],'
+    'AXIS["Easting",EAST],AXIS["Northing",NORTH]]'
+)
 
 
 class FakeDatabase:
@@ -111,7 +122,43 @@ def _matrix():
         bounds=[110.0, 29.99, 110.06, 30.0],
         before_window=[0, 0, 6, 1],
         after_window=[0, 0, 6, 1],
+        analysis={
+            "alignment_mode": "DIRECT",
+            "reference_period": "before",
+            "resolution": [0.01, 0.01],
+            "resampling": "none",
+            "coordinate_transform_tolerance": 0.0,
+            "alignment_tolerance_pixels": 1e-6,
+            "pixel_size_rtol": 1e-9,
+            "edge_rule": "target_pixel_center_full_cell",
+        },
     )
+
+
+def _write_raster_pair(
+    directory: Path,
+    classes: np.ndarray,
+    *,
+    transform: Affine,
+    crs: str,
+):
+    directory.mkdir()
+    profile = {
+        "driver": "GTiff",
+        "width": classes.shape[1],
+        "height": classes.shape[0],
+        "count": 1,
+        "dtype": "uint8",
+        "crs": crs,
+        "transform": transform,
+    }
+    classes_path = directory / "classes.tif"
+    valid_path = directory / "valid_mask.tif"
+    with rasterio.open(classes_path, "w", **profile) as dataset:
+        dataset.write(classes, 1)
+    with rasterio.open(valid_path, "w", **profile) as dataset:
+        dataset.write(np.ones_like(classes, dtype=np.uint8), 1)
+    return classes_path, valid_path
 
 
 def test_post_computes_after_releasing_request_connection_and_returns_saved_result():
@@ -131,6 +178,10 @@ def test_post_computes_after_releasing_request_connection_and_returns_saved_resu
         after_snapshot={"result_id": "after-result"},
         before_window=[0, 0, 6, 1],
         after_window=[0, 0, 6, 1],
+        calculation_version="transition-matrix-v2",
+        grid_policy_version="aligned-grid-v1",
+        analysis_identity_sha256="c" * 64,
+        analysis_metadata=_matrix().analysis,
         calculated_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
     )
     compute = Mock(side_effect=lambda *_: (_matrix() if db.rollbacks else (_ for _ in ()).throw(AssertionError("connection held"))))
@@ -149,7 +200,131 @@ def test_post_computes_after_releasing_request_connection_and_returns_saved_resu
     assert response.status_code == 200
     assert response.json()["data"]["status"] == "SUCCEEDED"
     assert response.json()["data"]["matrix_m2"] == _matrix().matrix_m2
+    assert response.json()["data"]["analysis"] == {
+        "calculation_version": "transition-matrix-v2",
+        "grid_policy_version": "aligned-grid-v1",
+        "identity_sha256": "c" * 64,
+        **_matrix().analysis,
+    }
     assert db.rollbacks >= 1
+
+
+def test_post_aligns_cross_crs_resolution_and_origin_with_real_spatial_calculation(tmp_path):
+    before_paths = _write_raster_pair(
+        tmp_path / "before-geographic",
+        np.array([[0, 1]], dtype=np.uint8),
+        transform=Affine(0.01, 0, 110, 0, -0.01, 30),
+        crs="EPSG:4326",
+    )
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32649", always_xy=True)
+    left, top = to_utm.transform(109.995, 30.005)
+    after_paths = _write_raster_pair(
+        tmp_path / "after-utm",
+        np.full((5, 9), 2, dtype=np.uint8),
+        transform=Affine(300, 0, left, 0, -300, top),
+        crs="EPSG:32649",
+    )
+    resolved = _resolved_pair()
+    resolved.before.classes_path, resolved.before.valid_mask_path = map(str, before_paths)
+    resolved.after.classes_path, resolved.after.valid_mask_path = map(str, after_paths)
+
+    async def save_result(_db, *, result, **_values):
+        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        return _processing(
+            status="SUCCEEDED",
+            completed_at=now,
+            matrix_m2=result.matrix_m2,
+            common_valid_area_m2=result.common_valid_area_m2,
+            crs=str(result.grid.crs),
+            transform=list(result.grid.transform)[:6],
+            raster_width=result.grid.width,
+            raster_height=result.grid.height,
+            bounds=result.bounds,
+            before_snapshot={"result_id": "before-result"},
+            after_snapshot={"result_id": "after-result"},
+            before_window=result.before_window,
+            after_window=result.after_window,
+            calculation_version="transition-matrix-v2",
+            grid_policy_version="aligned-grid-v1",
+            analysis_identity_sha256="c" * 64,
+            analysis_metadata=result.analysis,
+            calculated_at=now,
+        )
+
+    client, _ = _client()
+    with patch.object(
+        change_results,
+        "resolve_change_inputs",
+        new=AsyncMock(return_value=resolved),
+    ), patch.object(
+        change_results.crud_results,
+        "claim_request",
+        new=AsyncMock(return_value=SimpleNamespace(row=_processing(), should_start=True)),
+    ), patch.object(
+        change_results.crud_results,
+        "mark_succeeded",
+        new=AsyncMock(side_effect=save_result),
+    ), patch.object(change_results, "_heartbeat", new=AsyncMock()):
+        response = client.post("/api/change-results", json=_payload())
+
+    data = response.json()["data"]
+    assert response.status_code == 200
+    assert data["analysis"]["alignment_mode"] == "WARPED"
+    assert data["analysis"]["resampling"] == "nearest"
+    assert data["grid"]["crs"] == "EPSG:4326"
+    assert data["matrix_m2"][0][2] == pytest.approx(1069626.783188343, rel=1e-10)
+    assert data["matrix_m2"][1][2] == pytest.approx(1069626.783188343, rel=1e-10)
+    assert sum(sum(row) for row in data["matrix_m2"]) == pytest.approx(
+        data["common_valid_area_m2"],
+        rel=1e-12,
+    )
+
+
+def test_post_returns_stable_spatial_error_for_engineering_crs(tmp_path):
+    before_paths = _write_raster_pair(
+        tmp_path / "before-local-crs",
+        np.zeros((1, 2), dtype=np.uint8),
+        transform=Affine(2, 0, 0, 0, -2, 2),
+        crs=LOCAL_CRS_WKT,
+    )
+    after_paths = _write_raster_pair(
+        tmp_path / "after-local-crs",
+        np.zeros((1, 2), dtype=np.uint8),
+        transform=Affine(1, 0, 0, 0, -1, 1),
+        crs=LOCAL_CRS_WKT,
+    )
+    resolved = _resolved_pair()
+    resolved.before.classes_path, resolved.before.valid_mask_path = map(str, before_paths)
+    resolved.after.classes_path, resolved.after.valid_mask_path = map(str, after_paths)
+
+    async def save_failure(_db, **values):
+        return _processing(
+            status="FAILED",
+            completed_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+            error_http_status=values["http_status"],
+            error_code=values["error_code"],
+            error_message=values["message"],
+            error_data=values["error_data"],
+        )
+
+    client, _ = _client()
+    with patch.object(
+        change_results,
+        "resolve_change_inputs",
+        new=AsyncMock(return_value=resolved),
+    ), patch.object(
+        change_results.crud_results,
+        "claim_request",
+        new=AsyncMock(return_value=SimpleNamespace(row=_processing(), should_start=True)),
+    ), patch.object(
+        change_results.crud_results,
+        "mark_failed",
+        new=AsyncMock(side_effect=save_failure),
+    ), patch.object(change_results, "_heartbeat", new=AsyncMock()):
+        response = client.post("/api/change-results", json=_payload())
+
+    assert response.status_code == 422
+    assert response.json()["data"]["error_code"] == "SPATIAL_METADATA_UNAVAILABLE"
 
 
 def test_duplicate_processing_request_returns_202_without_computing():

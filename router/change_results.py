@@ -146,6 +146,12 @@ def _serialize(row) -> dict:
                 },
                 "before_window": row.before_window,
                 "after_window": row.after_window,
+                "analysis": {
+                    "calculation_version": row.calculation_version,
+                    "grid_policy_version": row.grid_policy_version,
+                    "identity_sha256": row.analysis_identity_sha256,
+                    **(row.analysis_metadata or {}),
+                },
                 "calculated_at": row.calculated_at.isoformat(),
             }
         )

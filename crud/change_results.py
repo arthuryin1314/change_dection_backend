@@ -1,3 +1,5 @@
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -8,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.change_results import ChangeResult
 from models.classification_results import ClassificationResult
 from utils.change_result_errors import CHANGE_RESULT_INTERRUPTED
+from utils.transition_matrix import CALCULATION_VERSION, GRID_POLICY_VERSION
 
 
 PROCESSING = "PROCESSING"
@@ -62,6 +65,8 @@ async def claim_request(db: AsyncSession, *, payload, user_id: int, owner: str, 
         after_result_id=payload.after_result_id,
         before_identity_sha256=payload.before_identity_sha256,
         after_identity_sha256=payload.after_identity_sha256,
+        calculation_version=CALCULATION_VERSION,
+        grid_policy_version=GRID_POLICY_VERSION,
         status=PROCESSING,
         lease_owner=owner,
         started_at=now,
@@ -107,6 +112,28 @@ def _owned_processing_request(request_id: str, user_id: int, owner: str):
 
 
 async def mark_succeeded(db, *, request_id, user_id, owner, resolved, result, now):
+    identity_payload = {
+        "before_identity_sha256": resolved.before.identity_sha256,
+        "after_identity_sha256": resolved.after.identity_sha256,
+        "calculation_version": CALCULATION_VERSION,
+        "grid_policy_version": GRID_POLICY_VERSION,
+        "grid": {
+            "crs": str(result.grid.crs),
+            "transform": list(result.grid.transform)[:6],
+            "width": result.grid.width,
+            "height": result.grid.height,
+            "bounds": result.bounds,
+        },
+        "analysis": result.analysis,
+    }
+    analysis_identity_sha256 = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     values = {
         "status": SUCCEEDED,
         "completed_at": now,
@@ -123,6 +150,10 @@ async def mark_succeeded(db, *, request_id, user_id, owner, resolved, result, no
         "bounds": result.bounds,
         "before_window": result.before_window,
         "after_window": result.after_window,
+        "calculation_version": CALCULATION_VERSION,
+        "grid_policy_version": GRID_POLICY_VERSION,
+        "analysis_identity_sha256": analysis_identity_sha256,
+        "analysis_metadata": result.analysis,
     }
     def source_is_current(source):
         return exists().where(

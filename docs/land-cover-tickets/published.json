@@ -3,7 +3,9 @@
     "number": 8,
     "file": "01b-area-display.md",
     "title": "1b：六类面积统计与统一单位展示",
-    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/8"
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/8",
+    "status": "completed",
+    "completionComment": "https://github.com/arthuryin1314/change_dection_backend/issues/8#issuecomment-5587484253"
   },
   "3": {
     "number": 13,
@@ -27,8 +29,11 @@
   "2": {
     "number": 9,
     "file": "02-matrix.md",
-    "title": "2：两期识别结果齐备后计算、展示并保存转移矩阵",
-    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/9"
+    "title": "2：两期转移矩阵｜实现完成，真实异图验收受数据限制（部分通过）",
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/9",
+    "status": "implemented-partial-acceptance",
+    "remoteSync": "verified",
+    "acceptanceComment": "https://github.com/arthuryin1314/change_dection_backend/issues/9#issuecomment-5602011526"
   },
   "5": {
     "number": 12,
@@ -40,6 +45,7 @@
     "number": 7,
     "file": "01-single-period.md",
     "title": "1a：分类结果契约与共享像元地表面积能力",
-    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/7"
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/7",
+    "status": "completed"
   }
 }

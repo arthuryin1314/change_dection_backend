@@ -13,6 +13,7 @@ from affine import Affine
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from psycopg2 import sql
 
 load_dotenv()
 
@@ -47,6 +48,7 @@ def _apply_migration() -> None:
     try:
         with connection.cursor() as cursor:
             cursor.execute(Path("migrations/003_change_results.sql").read_text(encoding="utf-8"))
+            cursor.execute(Path("migrations/004_change_result_analysis.sql").read_text(encoding="utf-8"))
         connection.commit()
     finally:
         connection.close()
@@ -270,6 +272,89 @@ def _cleanup(user_id: int) -> None:
         connection.close()
 
 
+def test_migration_004_backfills_legacy_rows_and_is_idempotent():
+    schema_name = f"change_migration_{uuid4().hex}"
+    connection = psycopg2.connect(_database_url())
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+            )
+            cursor.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            cursor.execute("CREATE TABLE user_info (id BIGINT PRIMARY KEY)")
+            cursor.execute("CREATE TABLE images (id INTEGER PRIMARY KEY)")
+            cursor.execute("CREATE TABLE model_library (id INTEGER PRIMARY KEY)")
+            cursor.execute("CREATE TABLE classification_results (id VARCHAR(32) PRIMARY KEY)")
+            cursor.execute(Path("migrations/003_change_results.sql").read_text(encoding="utf-8"))
+            cursor.execute("INSERT INTO user_info (id) VALUES (1)")
+            cursor.execute("INSERT INTO images (id) VALUES (1), (2)")
+            cursor.execute("INSERT INTO model_library (id) VALUES (1)")
+            cursor.execute(
+                "INSERT INTO classification_results (id) VALUES ('before'), ('after')"
+            )
+            cursor.execute(
+                """
+                INSERT INTO change_results (
+                    request_id, user_id, before_image_id, after_image_id,
+                    source_model_id, before_result_id, after_result_id,
+                    before_identity_sha256, after_identity_sha256,
+                    status, lease_owner, started_at, heartbeat_at
+                )
+                VALUES (
+                    %s, 1, 1, 2, 1, 'before', 'after', %s, %s,
+                    'SUCCEEDED', 'legacy-worker', NOW(), NOW()
+                )
+                """,
+                (str(uuid4()), "a" * 64, "b" * 64),
+            )
+
+            migration = Path("migrations/004_change_result_analysis.sql").read_text(
+                encoding="utf-8"
+            )
+            cursor.execute(migration)
+            cursor.execute(migration)
+            cursor.execute(
+                """
+                SELECT calculation_version, grid_policy_version,
+                       analysis_identity_sha256, analysis_metadata
+                FROM change_results
+                """
+            )
+            assert cursor.fetchone() == (
+                "transition-matrix-v1",
+                "same-grid-v0",
+                None,
+                None,
+            )
+            cursor.execute(
+                """
+                SELECT column_name, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'change_results'
+                  AND column_name IN ('calculation_version', 'grid_policy_version')
+                """,
+                (schema_name,),
+            )
+            assert dict(cursor.fetchall()) == {
+                "calculation_version": "NO",
+                "grid_policy_version": "NO",
+            }
+    finally:
+        connection.rollback()
+        with connection.cursor() as cursor:
+            cursor.execute("SET search_path TO public")
+            cursor.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+        connection.commit()
+        connection.close()
+
+
 def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_path):
     seeded = _seed(tmp_path)
     request_id = str(uuid4())
@@ -300,6 +385,10 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
                 sum(sum(row) for row in data["matrix_m2"]),
                 rel=1e-12,
             )
+            assert data["analysis"]["calculation_version"] == "transition-matrix-v2"
+            assert data["analysis"]["grid_policy_version"] == "aligned-grid-v1"
+            assert len(data["analysis"]["identity_sha256"]) == 64
+            assert data["analysis"]["alignment_mode"] == "DIRECT"
 
             reloaded_client = client
             fetched = reloaded_client.get(f"/api/change-results/{request_id}")
