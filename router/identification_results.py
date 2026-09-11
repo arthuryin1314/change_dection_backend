@@ -9,7 +9,10 @@ from uuid import uuid4
 from affine import Affine
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
+from pyproj import CRS
+from pyproj.exceptions import CRSError as ProjectionError
 from rasterio.errors import CRSError
+from rasterio._err import CPLE_BaseError
 from rasterio.warp import transform_bounds
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -316,6 +319,17 @@ def _serialize_result(row) -> dict:
     return data
 
 
+def _crs_label(value: str | None) -> str:
+    if value is None:
+        return "未记录"
+    try:
+        crs = CRS.from_user_input(value)
+        epsg = crs.to_epsg()
+        return f"EPSG:{epsg} · {crs.name}" if epsg is not None else crs.name
+    except ProjectionError:
+        return "无法识别的坐标系"
+
+
 def _history_render_status(row) -> str:
     if row.classes_path is None or row.valid_mask_path is None:
         return "UNAVAILABLE"
@@ -372,6 +386,7 @@ async def get_identification_history(
     if row is None:
         raise HTTPException(status_code=404, detail="历史记录不存在或无权访问")
     data = _serialize_result(row)
+    data["crs_label"] = await asyncio.to_thread(_crs_label, row.crs)
     data["render_status"] = _history_render_status(row)
     data["render_grid"] = None
     data["render_error"] = None
@@ -386,7 +401,7 @@ async def get_identification_history(
             if not all(math.isfinite(value) for value in bounds) or left >= right or bottom >= top:
                 raise ValueError("展示范围无效")
             data["render_grid"] = {"crs": "EPSG:3857", "bounds": list(bounds)}
-        except (CRSError, ValueError, TypeError):
+        except (CRSError, CPLE_BaseError, ValueError, TypeError):
             data["render_error"] = "分类图坐标系或范围无法转换为地图坐标，请检查空间网格信息"
     return api_response(200, "查询成功", data)
 
