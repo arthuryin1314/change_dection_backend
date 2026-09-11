@@ -46,7 +46,12 @@ async def login_user(form_data: UserLoginRequest, db: AsyncSession = Depends(get
     token = await create_token(db, db_user.id)
     await db.commit()
     return success_response(message='登录成功', data={
-        'token': token
+        'token': token,
+        'userInfo': {
+            'id': db_user.id,
+            'username': db_user.username,
+            'telNum': db_user.phone,
+        },
     })
 
 

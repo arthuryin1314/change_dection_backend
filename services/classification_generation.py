@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 from time import perf_counter
-from typing import Callable, Protocol
+from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
 import rasterio
@@ -21,6 +21,7 @@ from utils.classification_storage import (
 )
 from utils.classification_result_lock import classification_result_lock
 from utils.deeplab_service import model_tile_predictor
+from utils.content_hash import resolve_content_sha256
 from utils.streaming_classification import (
     ClassificationGenerationCancelled,
     StreamingMetrics,
@@ -36,8 +37,10 @@ logger = logging.getLogger(__name__)
 class GenerationRequest:
     result_id: str
     image_path: str | Path
+    image_sha256: str
     weight_file_path: str
     weight_sha256: str
+    inference_parameters: Mapping[str, int]
     storage_root: str | Path
 
 
@@ -56,6 +59,17 @@ class GenerationOutcome:
     stored: StoredClassification
     metadata: SpatialMetadata
     metrics: StreamingMetrics
+
+
+class InputVersionChangedError(RuntimeError):
+    pass
+
+
+def _verify_request_sources(request: GenerationRequest) -> None:
+    image_hash = resolve_content_sha256(request.image_path).sha256
+    weight_hash = resolve_content_sha256(request.weight_file_path).sha256
+    if image_hash != request.image_sha256 or weight_hash != request.weight_sha256:
+        raise InputVersionChangedError("识别输入在任务执行期间发生变化")
 
 
 class GenerationLifecycle(Protocol):
@@ -203,6 +217,8 @@ def _generate_classification_files_unlocked(
                     for band in stream_classification_bands(
                         source,
                         predict_tile,
+                        tile_size=request.inference_parameters["tile_size"],
+                        overlap=request.inference_parameters["overlap"],
                         metrics=metrics,
                         cancellation_event=cancellation_event,
                     ):
@@ -219,6 +235,7 @@ def _generate_classification_files_unlocked(
 
                     def before_publish() -> None:
                         _raise_if_cancelled(cancellation_event)
+                        _verify_request_sources(request)
                         if publication_guard is not None:
                             publication_guard()
                         _raise_if_cancelled(cancellation_event)

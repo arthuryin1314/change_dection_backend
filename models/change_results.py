@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Index,
 )
 
 from models.Base import Base
@@ -24,6 +25,22 @@ class ChangeResult(Base):
         CheckConstraint(
             "status IN ('PROCESSING', 'SUCCEEDED', 'FAILED')",
             name="ck_change_results_status",
+        ),
+        Index(
+            "uq_change_results_active_preparation",
+            "user_id",
+            "preparation_key",
+            unique=True,
+            postgresql_where="status = 'PROCESSING'",
+        ),
+        Index(
+            "uq_change_results_active_identity",
+            "user_id",
+            "orchestration_identity_sha256",
+            unique=True,
+            postgresql_where=(
+                "status = 'PROCESSING' AND orchestration_identity_sha256 IS NOT NULL"
+            ),
         ),
     )
 
@@ -39,8 +56,13 @@ class ChangeResult(Base):
     source_model_id = Column(Integer, ForeignKey("model_library.id", ondelete="SET NULL"))
     before_result_id = Column(String(32), ForeignKey("classification_results.id", ondelete="SET NULL"))
     after_result_id = Column(String(32), ForeignKey("classification_results.id", ondelete="SET NULL"))
-    before_identity_sha256 = Column(String(64), nullable=False)
-    after_identity_sha256 = Column(String(64), nullable=False)
+    before_identity_sha256 = Column(String(64))
+    after_identity_sha256 = Column(String(64))
+    preparation_key = Column(String(64))
+    orchestration_identity_sha256 = Column(String(64))
+    phase = Column(String(32), nullable=False, default="PREPARING")
+    submitted_inputs = Column(JSON, nullable=False, default=dict)
+    frozen_inputs = Column(JSON)
     calculation_version = Column(String(64), nullable=False)
     grid_policy_version = Column(String(64), nullable=False)
     analysis_identity_sha256 = Column(String(64))
@@ -66,6 +88,34 @@ class ChangeResult(Base):
     before_window = Column(JSON)
     after_window = Column(JSON)
     calculated_at = Column(DateTime(timezone=True))
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+class ChangeRequest(Base):
+    __tablename__ = "change_requests"
+    __table_args__ = (
+        UniqueConstraint("user_id", "request_id", name="uq_change_requests_user_request"),
+        Index("ix_change_requests_result", "change_result_id"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(
+        BigInteger,
+        ForeignKey("user_info.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_id = Column(String(36), nullable=False)
+    request_fingerprint = Column(String(64), nullable=False)
+    change_result_id = Column(
+        BigInteger,
+        ForeignKey("change_results.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    retry_of_request_id = Column(String(36))
     created_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

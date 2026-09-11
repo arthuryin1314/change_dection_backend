@@ -11,7 +11,9 @@
     "number": 13,
     "file": "03-grid-alignment.md",
     "title": "3：不同坐标系与分辨率的影像自动对齐后分析",
-    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/13"
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/13",
+    "status": "completed",
+    "completionComment": "https://github.com/arthuryin1314/change_dection_backend/issues/13#issuecomment-5618854053"
   },
   "4a": {
     "number": 10,
@@ -29,11 +31,12 @@
   "2": {
     "number": 9,
     "file": "02-matrix.md",
-    "title": "2：两期转移矩阵｜实现完成，真实异图验收受数据限制（部分通过）",
+    "title": "2：两期转移矩阵（已完成，真实异图补验通过）",
     "url": "https://github.com/arthuryin1314/change_dection_backend/issues/9",
-    "status": "implemented-partial-acceptance",
+    "status": "completed",
     "remoteSync": "verified",
-    "acceptanceComment": "https://github.com/arthuryin1314/change_dection_backend/issues/9#issuecomment-5602011526"
+    "acceptanceComment": "https://github.com/arthuryin1314/change_dection_backend/issues/9#issuecomment-5602011526",
+    "completionComment": "https://github.com/arthuryin1314/change_dection_backend/issues/9#issuecomment-5618854695"
   },
   "5": {
     "number": 12,

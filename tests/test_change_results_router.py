@@ -1,31 +1,23 @@
 import os
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import numpy as np
-import pytest
-import rasterio
-from affine import Affine
-from pyproj import Transformer
-
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/test")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+asyncpg://user:pass@localhost/test",
+)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from config.db_config import get_db
 from router import change_results
-from utils.classification_storage import RasterGrid
 from utils.get_user_by_token import get_current_user
-from utils.transition_matrix import TransitionMatrixError, TransitionMatrixResult
 
 
-LOCAL_CRS_WKT = (
-    'LOCAL_CS["arbitrary",LOCAL_DATUM["unknown",0],UNIT["metre",1],'
-    'AXIS["Easting",EAST],AXIS["Northing",NORTH]]'
-)
+REQUEST_ID = "90f0bdba-6b7e-4a45-a078-dce12340f6d2"
+RETRY_ID = "16328ca2-acde-4f57-a8f5-201cbeec84f1"
 
 
 class FakeDatabase:
@@ -40,8 +32,8 @@ class FakeDatabase:
         self.rollbacks += 1
 
 
-def _client(db=None):
-    database = db or FakeDatabase()
+def _client(user_id=7):
+    database = FakeDatabase()
 
     async def override_db():
         yield database
@@ -49,445 +41,356 @@ def _client(db=None):
     app = FastAPI()
     app.include_router(change_results.router)
     app.dependency_overrides[get_db] = override_db
-    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=7)
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
     return TestClient(app), database
 
 
-def _payload():
+def _payload(request_id=REQUEST_ID):
     return {
-        "request_id": "90f0bdba-6b7e-4a45-a078-dce12340f6d2",
+        "request_id": request_id,
         "before_image_id": 1,
         "after_image_id": 2,
         "model_id": 11,
-        "before_result_id": "before-result",
-        "before_identity_sha256": "a" * 64,
-        "after_result_id": "after-result",
-        "after_identity_sha256": "b" * 64,
     }
 
 
-def _processing(**overrides):
-    now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+def _submitted():
+    return {
+        "before_image_id": 1,
+        "after_image_id": 2,
+        "model_id": 11,
+        "before": {
+            "path": "uploads/images/before.tif",
+            "cached_sha256": "1" * 64,
+            "cached_size": 10,
+            "cached_mtime_ns": 100,
+        },
+        "after": {
+            "path": "uploads/images/after.tif",
+            "cached_sha256": "2" * 64,
+            "cached_size": 11,
+            "cached_mtime_ns": 101,
+        },
+        "model": {
+            "weight_path": "uploads/model_assets/weights.pth",
+            "cached_sha256": "3" * 64,
+            "cached_size": 12,
+            "cached_mtime_ns": 102,
+        },
+        "identity_contract": {
+            "inference_parameters": {"tile_size": 512, "overlap": 128},
+            "classification_scheme_version": "land-cover-6/v1",
+            "pipeline_version": "deeplab-native/v1",
+            "grid_policy_version": "native-v1",
+        },
+    }
+
+
+def _row(**overrides):
+    now = datetime(2026, 9, 10, tzinfo=timezone.utc)
     values = {
-        "request_id": _payload()["request_id"],
+        "id": 41,
+        "request_id": REQUEST_ID,
         "user_id": 7,
         "status": "PROCESSING",
-        "lease_owner": "worker",
+        "phase": "PREPARING",
+        "lease_owner": "owner",
         "started_at": now,
         "heartbeat_at": now,
         "completed_at": None,
+        "before_image_id": 1,
+        "after_image_id": 2,
+        "source_model_id": 11,
+        "before_result_id": None,
+        "before_identity_sha256": None,
+        "after_result_id": None,
+        "after_identity_sha256": None,
+        "submitted_inputs": _submitted(),
         "error_http_status": None,
         "error_code": None,
         "error_message": None,
         "error_data": None,
-        "matrix_m2": None,
-        "before_image_id": 1,
-        "after_image_id": 2,
-        "source_model_id": 11,
-        "before_result_id": "before-result",
-        "before_identity_sha256": "a" * 64,
-        "after_result_id": "after-result",
-        "after_identity_sha256": "b" * 64,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
-def _resolved_pair():
-    before = SimpleNamespace(
-        id="before-result",
-        identity_sha256="a" * 64,
-        classes_path="before/classes.tif",
-        valid_mask_path="before/valid_mask.tif",
-        source_image_id=1,
-        source_model_id=11,
-        image_content_sha256="1" * 64,
-        weight_content_sha256="2" * 64,
-        inference_parameters={"tile_size": 512},
-        classification_scheme_version="land-cover-v1",
-        pipeline_version="pipeline-v1",
-        grid_policy_version="native-grid-v1",
-        completed_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
-        lease_owner="before-generation",
-    )
-    after = SimpleNamespace(**{**before.__dict__, "id": "after-result", "identity_sha256": "b" * 64, "source_image_id": 2})
-    return SimpleNamespace(before=before, after=after)
-
-
-def _matrix():
-    return TransitionMatrixResult(
-        matrix_m2=[[1.0 if row == column else 0.0 for column in range(6)] for row in range(6)],
-        common_valid_area_m2=6.0,
-        grid=RasterGrid(width=6, height=1, crs="EPSG:4326", transform=(0.01, 0, 110, 0, -0.01, 30)),
-        bounds=[110.0, 29.99, 110.06, 30.0],
-        before_window=[0, 0, 6, 1],
-        after_window=[0, 0, 6, 1],
-        analysis={
-            "alignment_mode": "DIRECT",
-            "reference_period": "before",
-            "resolution": [0.01, 0.01],
-            "resampling": "none",
-            "coordinate_transform_tolerance": 0.0,
-            "alignment_tolerance_pixels": 1e-6,
-            "pixel_size_rtol": 1e-9,
-            "edge_rule": "target_pixel_center_full_cell",
-        },
-    )
-
-
-def _write_raster_pair(
-    directory: Path,
-    classes: np.ndarray,
-    *,
-    transform: Affine,
-    crs: str,
-):
-    directory.mkdir()
-    profile = {
-        "driver": "GTiff",
-        "width": classes.shape[1],
-        "height": classes.shape[0],
-        "count": 1,
-        "dtype": "uint8",
-        "crs": crs,
-        "transform": transform,
-    }
-    classes_path = directory / "classes.tif"
-    valid_path = directory / "valid_mask.tif"
-    with rasterio.open(classes_path, "w", **profile) as dataset:
-        dataset.write(classes, 1)
-    with rasterio.open(valid_path, "w", **profile) as dataset:
-        dataset.write(np.ones_like(classes, dtype=np.uint8), 1)
-    return classes_path, valid_path
-
-
-def test_post_computes_after_releasing_request_connection_and_returns_saved_result():
-    client, db = _client()
-    processing = _processing()
-    succeeded = _processing(
+def _succeeded():
+    row = _row(
         status="SUCCEEDED",
-        completed_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
-        matrix_m2=_matrix().matrix_m2,
-        common_valid_area_m2=6.0,
-        crs="EPSG:4326",
-        transform=[0.01, 0, 110, 0, -0.01, 30],
-        raster_width=6,
+        phase="SUCCEEDED",
+        completed_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+        before_result_id="before-result",
+        before_identity_sha256="a" * 64,
+        after_result_id="after-result",
+        after_identity_sha256="b" * 64,
+        before_snapshot={"result_id": "before-result", "identity_sha256": "a" * 64},
+        after_snapshot={"result_id": "after-result", "identity_sha256": "b" * 64},
+        matrix_m2=[[0.0] * 6 for _ in range(6)],
+        common_valid_area_m2=1.0,
+        crs="EPSG:4528",
+        transform=[1, 0, 0, 0, -1, 1],
+        raster_width=1,
         raster_height=1,
-        bounds=_matrix().bounds,
-        before_snapshot={"result_id": "before-result"},
-        after_snapshot={"result_id": "after-result"},
-        before_window=[0, 0, 6, 1],
-        after_window=[0, 0, 6, 1],
+        bounds=[0, 0, 1, 1],
+        before_window=None,
+        after_window=None,
         calculation_version="transition-matrix-v2",
         grid_policy_version="aligned-grid-v1",
         analysis_identity_sha256="c" * 64,
-        analysis_metadata=_matrix().analysis,
-        calculated_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        analysis_metadata={"alignment_mode": "DIRECT"},
+        calculated_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
     )
-    compute = Mock(side_effect=lambda *_: (_matrix() if db.rollbacks else (_ for _ in ()).throw(AssertionError("connection held"))))
-
-    with patch.object(change_results, "resolve_change_inputs", new=AsyncMock(return_value=_resolved_pair())), patch.object(
-        change_results.crud_results,
-        "claim_request",
-        new=AsyncMock(return_value=SimpleNamespace(row=processing, should_start=True)),
-    ), patch.object(change_results, "compute_transition_matrix_m2", new=compute), patch.object(
-        change_results.crud_results,
-        "mark_succeeded",
-        new=AsyncMock(return_value=succeeded),
-    ), patch.object(change_results, "_heartbeat", new=AsyncMock()):
-        response = client.post("/api/change-results", json=_payload())
-
-    assert response.status_code == 200
-    assert response.json()["data"]["status"] == "SUCCEEDED"
-    assert response.json()["data"]["matrix_m2"] == _matrix().matrix_m2
-    assert response.json()["data"]["analysis"] == {
-        "calculation_version": "transition-matrix-v2",
-        "grid_policy_version": "aligned-grid-v1",
-        "identity_sha256": "c" * 64,
-        **_matrix().analysis,
-    }
-    assert db.rollbacks >= 1
+    return row
 
 
-def test_post_aligns_cross_crs_resolution_and_origin_with_real_spatial_calculation(tmp_path):
-    before_paths = _write_raster_pair(
-        tmp_path / "before-geographic",
-        np.array([[0, 1]], dtype=np.uint8),
-        transform=Affine(0.01, 0, 110, 0, -0.01, 30),
-        crs="EPSG:4326",
-    )
-    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32649", always_xy=True)
-    left, top = to_utm.transform(109.995, 30.005)
-    after_paths = _write_raster_pair(
-        tmp_path / "after-utm",
-        np.full((5, 9), 2, dtype=np.uint8),
-        transform=Affine(300, 0, left, 0, -300, top),
-        crs="EPSG:32649",
-    )
-    resolved = _resolved_pair()
-    resolved.before.classes_path, resolved.before.valid_mask_path = map(str, before_paths)
-    resolved.after.classes_path, resolved.after.valid_mask_path = map(str, after_paths)
-
-    async def save_result(_db, *, result, **_values):
-        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
-        return _processing(
-            status="SUCCEEDED",
-            completed_at=now,
-            matrix_m2=result.matrix_m2,
-            common_valid_area_m2=result.common_valid_area_m2,
-            crs=str(result.grid.crs),
-            transform=list(result.grid.transform)[:6],
-            raster_width=result.grid.width,
-            raster_height=result.grid.height,
-            bounds=result.bounds,
-            before_snapshot={"result_id": "before-result"},
-            after_snapshot={"result_id": "after-result"},
-            before_window=result.before_window,
-            after_window=result.after_window,
-            calculation_version="transition-matrix-v2",
-            grid_policy_version="aligned-grid-v1",
-            analysis_identity_sha256="c" * 64,
-            analysis_metadata=result.analysis,
-            calculated_at=now,
-        )
-
+def test_post_always_returns_202_and_schedules_new_task():
     client, _ = _client()
-    with patch.object(
-        change_results,
-        "resolve_change_inputs",
-        new=AsyncMock(return_value=resolved),
-    ), patch.object(
-        change_results.crud_results,
-        "claim_request",
-        new=AsyncMock(return_value=SimpleNamespace(row=_processing(), should_start=True)),
-    ), patch.object(
-        change_results.crud_results,
-        "mark_succeeded",
-        new=AsyncMock(side_effect=save_result),
-    ), patch.object(change_results, "_heartbeat", new=AsyncMock()):
-        response = client.post("/api/change-results", json=_payload())
-
-    data = response.json()["data"]
-    assert response.status_code == 200
-    assert data["analysis"]["alignment_mode"] == "WARPED"
-    assert data["analysis"]["resampling"] == "nearest"
-    assert data["grid"]["crs"] == "EPSG:4326"
-    assert data["matrix_m2"][0][2] == pytest.approx(1069626.783188343, rel=1e-10)
-    assert data["matrix_m2"][1][2] == pytest.approx(1069626.783188343, rel=1e-10)
-    assert sum(sum(row) for row in data["matrix_m2"]) == pytest.approx(
-        data["common_valid_area_m2"],
-        rel=1e-12,
+    row = _row()
+    claim = SimpleNamespace(
+        row=row,
+        should_start=True,
+        request_conflict=False,
     )
-
-
-def test_post_returns_stable_spatial_error_for_engineering_crs(tmp_path):
-    before_paths = _write_raster_pair(
-        tmp_path / "before-local-crs",
-        np.zeros((1, 2), dtype=np.uint8),
-        transform=Affine(2, 0, 0, 0, -2, 2),
-        crs=LOCAL_CRS_WKT,
-    )
-    after_paths = _write_raster_pair(
-        tmp_path / "after-local-crs",
-        np.zeros((1, 2), dtype=np.uint8),
-        transform=Affine(1, 0, 0, 0, -1, 1),
-        crs=LOCAL_CRS_WKT,
-    )
-    resolved = _resolved_pair()
-    resolved.before.classes_path, resolved.before.valid_mask_path = map(str, before_paths)
-    resolved.after.classes_path, resolved.after.valid_mask_path = map(str, after_paths)
-
-    async def save_failure(_db, **values):
-        return _processing(
-            status="FAILED",
-            completed_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
-            error_http_status=values["http_status"],
-            error_code=values["error_code"],
-            error_message=values["message"],
-            error_data=values["error_data"],
-        )
-
-    client, _ = _client()
-    with patch.object(
-        change_results,
-        "resolve_change_inputs",
-        new=AsyncMock(return_value=resolved),
-    ), patch.object(
-        change_results.crud_results,
-        "claim_request",
-        new=AsyncMock(return_value=SimpleNamespace(row=_processing(), should_start=True)),
-    ), patch.object(
-        change_results.crud_results,
-        "mark_failed",
-        new=AsyncMock(side_effect=save_failure),
-    ), patch.object(change_results, "_heartbeat", new=AsyncMock()):
-        response = client.post("/api/change-results", json=_payload())
-
-    assert response.status_code == 422
-    assert response.json()["data"]["error_code"] == "SPATIAL_METADATA_UNAVAILABLE"
-
-
-def test_duplicate_processing_request_returns_202_without_computing():
-    client, _ = _client()
+    schedule = Mock()
     with patch.object(
         change_results.crud_results,
-        "claim_request",
-        new=AsyncMock(return_value=SimpleNamespace(row=_processing(), should_start=False)),
-    ), patch.object(change_results, "resolve_change_inputs") as resolve, patch.object(
+        "get_request_binding",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
         change_results,
-        "compute_transition_matrix_m2",
-    ) as compute:
+        "_submitted_inputs",
+        new=AsyncMock(return_value=_submitted()),
+    ), patch.object(
+        change_results.crud_results,
+        "claim_submission",
+        new=AsyncMock(return_value=claim),
+    ), patch.object(
+        change_results,
+        "schedule_change_orchestration",
+        new=schedule,
+    ):
         response = client.post("/api/change-results", json=_payload())
 
     assert response.status_code == 202
-    assert response.json()["data"]["status"] == "PROCESSING"
-    resolve.assert_not_called()
-    compute.assert_not_called()
+    assert response.json()["data"]["phase"] == "PREPARING"
+    schedule.assert_called_once_with(41, 7, "owner")
 
 
-def test_duplicate_request_id_with_different_inputs_returns_409():
+def test_post_replay_of_completed_request_still_returns_202():
     client, _ = _client()
-    existing = _processing(after_image_id=99)
+    binding = SimpleNamespace(
+        change_result_id=41,
+        request_fingerprint=change_results._request_fingerprint(
+            change_results.CreateChangeResultRequest(**_payload())
+        ),
+    )
     with patch.object(
         change_results.crud_results,
-        "claim_request",
-        new=AsyncMock(return_value=SimpleNamespace(row=existing, should_start=False)),
-    ), patch.object(change_results, "resolve_change_inputs") as resolve:
+        "get_request_binding",
+        new=AsyncMock(return_value=binding),
+    ), patch.object(
+        change_results.crud_results,
+        "get_by_id",
+        new=AsyncMock(return_value=_succeeded()),
+    ):
+        response = client.post("/api/change-results", json=_payload())
+
+    assert response.status_code == 202
+    assert response.json()["data"]["status"] == "SUCCEEDED"
+
+
+def test_post_replay_of_failed_request_returns_202_with_retry_details():
+    client, _ = _client()
+    binding = SimpleNamespace(
+        change_result_id=41,
+        request_fingerprint=change_results._request_fingerprint(
+            change_results.CreateChangeResultRequest(**_payload())
+        ),
+    )
+    failed = _row(
+        status="FAILED",
+        phase="FAILED",
+        completed_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+        error_code="IDENTIFICATION_EXECUTION_FAILED",
+        error_message="识别执行失败",
+        error_data={"retryable": True, "periods": {"after": {"reason": "推理失败"}}},
+    )
+    with patch.object(
+        change_results.crud_results,
+        "get_request_binding",
+        new=AsyncMock(return_value=binding),
+    ), patch.object(
+        change_results.crud_results,
+        "get_by_id",
+        new=AsyncMock(return_value=failed),
+    ):
+        response = client.post("/api/change-results", json=_payload())
+
+    assert response.status_code == 202
+    assert response.json()["data"]["error_code"] == "IDENTIFICATION_EXECUTION_FAILED"
+    assert response.json()["data"]["error_data"]["retryable"] is True
+
+
+def test_post_replay_upgrades_matching_legacy_request_fingerprint():
+    client, database = _client()
+    binding = SimpleNamespace(
+        change_result_id=41,
+        request_fingerprint="legacy:0123456789abcdef0123456789abcdef",
+    )
+    with patch.object(
+        change_results.crud_results,
+        "get_request_binding",
+        new=AsyncMock(return_value=binding),
+    ), patch.object(
+        change_results.crud_results,
+        "get_by_id",
+        new=AsyncMock(return_value=_succeeded()),
+    ):
+        response = client.post("/api/change-results", json=_payload())
+
+    assert response.status_code == 202
+    assert binding.request_fingerprint == change_results._request_fingerprint(
+        change_results.CreateChangeResultRequest(**_payload())
+    )
+    assert database.commits == 1
+
+
+def test_post_rejects_legacy_request_id_for_different_selection():
+    client, database = _client()
+    binding = SimpleNamespace(
+        change_result_id=41,
+        request_fingerprint="legacy:0123456789abcdef0123456789abcdef",
+    )
+    row = _succeeded()
+    row.after_image_id = 99
+    with patch.object(
+        change_results.crud_results,
+        "get_request_binding",
+        new=AsyncMock(return_value=binding),
+    ), patch.object(
+        change_results.crud_results,
+        "get_by_id",
+        new=AsyncMock(return_value=row),
+    ):
         response = client.post("/api/change-results", json=_payload())
 
     assert response.status_code == 409
     assert response.json()["data"]["error_code"] == "REQUEST_ID_CONFLICT"
-    resolve.assert_not_called()
+    assert binding.request_fingerprint.startswith("legacy:")
+    assert database.commits == 0
 
 
-def test_domain_failure_returns_structured_422_and_persists_failure():
+def test_post_rejects_same_request_id_for_different_selection():
     client, _ = _client()
-    failure = _processing(
-        status="FAILED",
-        error_http_status=422,
-        error_code="GRID_MISMATCH",
-        error_message="两期栅格像元大小不一致",
-        error_data={"request_id": _payload()["request_id"]},
+    binding = SimpleNamespace(
+        change_result_id=41,
+        request_fingerprint="f" * 64,
     )
-    mark_failed = AsyncMock(return_value=failure)
-    with patch.object(change_results, "resolve_change_inputs", new=AsyncMock(return_value=_resolved_pair())), patch.object(
+    with patch.object(
         change_results.crud_results,
-        "claim_request",
-        new=AsyncMock(return_value=SimpleNamespace(row=_processing(), should_start=True)),
-    ), patch.object(
-        change_results,
-        "compute_transition_matrix_m2",
-        side_effect=TransitionMatrixError("GRID_MISMATCH", "两期栅格像元大小不一致"),
-    ), patch.object(change_results.crud_results, "mark_failed", new=mark_failed), patch.object(
-        change_results,
-        "_heartbeat",
-        new=AsyncMock(),
+        "get_request_binding",
+        new=AsyncMock(return_value=binding),
     ):
         response = client.post("/api/change-results", json=_payload())
 
-    assert response.status_code == 422
-    assert response.json()["data"]["error_code"] == "GRID_MISMATCH"
-    assert response.json()["data"]["request_id"] == _payload()["request_id"]
-    mark_failed.assert_awaited_once()
+    assert response.status_code == 409
+    assert response.json()["data"]["error_code"] == "REQUEST_ID_CONFLICT"
 
 
-
-def test_change_input_failures_report_both_periods_with_stable_reasons():
-    payload = change_results.CreateChangeResultRequest(**_payload())
-    resolutions = [
-        SimpleNamespace(status="MISSING", reason="VERSION_MISMATCH", row=None),
-        SimpleNamespace(status="PROCESSING", reason="PROCESSING", row=None),
-    ]
-    with patch.object(
-        change_results,
-        "resolve_identification_for_change",
-        new=AsyncMock(side_effect=resolutions),
-    ):
-        try:
-            import asyncio
-            asyncio.run(change_results.resolve_change_inputs(object(), 7, payload))
-        except change_results.ChangeInputError as error:
-            assert error.periods == {
-                "before": {"reason": "VERSION_MISMATCH", "status": "MISSING"},
-                "after": {"reason": "INCOMPLETE", "status": "PROCESSING"},
-            }
-        else:
-            raise AssertionError("expected ChangeInputError")
-
-
-@pytest.mark.parametrize(
-    ("period_statuses", "expected_periods"),
-    [
-        (
-            ("MISSING", "SUCCEEDED"),
-            {"before": {"reason": "MISSING", "status": "MISSING"}},
-        ),
-        (
-            ("SUCCEEDED", "MISSING"),
-            {"after": {"reason": "MISSING", "status": "MISSING"}},
-        ),
-        (
-            ("MISSING", "MISSING"),
-            {
-                "before": {"reason": "MISSING", "status": "MISSING"},
-                "after": {"reason": "MISSING", "status": "MISSING"},
-            },
-        ),
-        (
-            ("PROCESSING", "FAILED"),
-            {
-                "before": {"reason": "INCOMPLETE", "status": "PROCESSING"},
-                "after": {"reason": "INCOMPLETE", "status": "FAILED"},
-            },
-        ),
-    ],
-)
-def test_api_reports_unavailable_periods_without_computing(period_statuses, expected_periods):
+def test_get_processing_includes_selection_and_period_progress():
     client, _ = _client()
-    resolved = _resolved_pair()
-    rows = (resolved.before, resolved.after)
-    resolutions = [
-        SimpleNamespace(
-            status=status,
-            reason="MISSING" if status == "MISSING" else status,
-            row=row if status == "SUCCEEDED" else None,
-        )
-        for status, row in zip(period_statuses, rows)
-    ]
-
-    async def persist_failure(_db, **values):
-        return _processing(
-            status="FAILED",
-            completed_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
-            error_http_status=values["http_status"],
-            error_code=values["error_code"],
-            error_message=values["message"],
-            error_data=values["error_data"],
-        )
-
-    compute = Mock()
-    resolve = AsyncMock(side_effect=resolutions)
+    row = _row(
+        phase="ENSURING_AFTER",
+        before_result_id="before-result",
+        before_identity_sha256="a" * 64,
+    )
     with patch.object(
         change_results.crud_results,
-        "claim_request",
-        new=AsyncMock(return_value=SimpleNamespace(row=_processing(), should_start=True)),
-    ), patch.object(
-        change_results,
-        "resolve_identification_for_change",
-        new=resolve,
-    ), patch.object(
-        change_results,
-        "compute_transition_matrix_m2",
-        new=compute,
+        "expire_request",
+        new=AsyncMock(return_value=0),
     ), patch.object(
         change_results.crud_results,
-        "mark_failed",
-        new=AsyncMock(side_effect=persist_failure),
+        "get_by_request",
+        new=AsyncMock(return_value=row),
     ):
-        response = client.post("/api/change-results", json=_payload())
+        response = client.get(f"/api/change-results/{REQUEST_ID}")
 
-    assert response.status_code == 422
-    assert response.json()["data"]["error_code"] == "IDENTIFICATION_RESULT_UNAVAILABLE"
-    assert response.json()["data"]["periods"] == expected_periods
-    assert resolve.await_count == 2
-    compute.assert_not_called()
+    assert response.status_code == 202
+    data = response.json()["data"]
+    assert data["inputs"] == {
+        "before_image_id": 1,
+        "after_image_id": 2,
+        "model_id": 11,
+    }
+    assert data["periods"]["before"]["status"] == "SUCCEEDED"
+    assert data["periods"]["after"]["status"] == "PROCESSING"
+
+
+def test_retry_expires_stale_request_before_checking_failed_state():
+    client, _ = _client()
+    stale = _row(
+        heartbeat_at=datetime.now(timezone.utc) - timedelta(minutes=3),
+    )
+    failed = _row(
+        status="FAILED",
+        phase="FAILED",
+        error_http_status=409,
+        error_code="CHANGE_RESULT_INTERRUPTED",
+        error_message="变化分析执行已中断",
+        error_data={"retryable": True},
+    )
+    order = []
+
+    async def expire(*_args, **_kwargs):
+        order.append("expire")
+        return 1
+
+    async def reload(*_args, **_kwargs):
+        order.append("reload")
+        return failed if order and order[0] == "expire" else stale
+
+    claim = SimpleNamespace(
+        row=_row(id=42, request_id=RETRY_ID),
+        should_start=True,
+        request_conflict=False,
+    )
+    with patch.object(
+        change_results.crud_results,
+        "expire_request",
+        new=AsyncMock(side_effect=expire),
+    ), patch.object(
+        change_results.crud_results,
+        "get_by_request",
+        new=AsyncMock(side_effect=reload),
+    ), patch.object(
+        change_results.crud_results,
+        "claim_submission",
+        new=AsyncMock(return_value=claim),
+    ), patch.object(
+        change_results,
+        "schedule_change_orchestration",
+    ):
+        response = client.post(
+            f"/api/change-results/{REQUEST_ID}/retry",
+            json={"request_id": RETRY_ID},
+        )
+
+    assert response.status_code == 202
+    assert order[:2] == ["expire", "reload"]
+
+
+def test_get_other_users_request_returns_404():
+    client, _ = _client(user_id=8)
+    with patch.object(
+        change_results.crud_results,
+        "expire_request",
+        new=AsyncMock(return_value=0),
+    ), patch.object(
+        change_results.crud_results,
+        "get_by_request",
+        new=AsyncMock(return_value=None),
+    ):
+        response = client.get(f"/api/change-results/{REQUEST_ID}")
+
+    assert response.status_code == 404

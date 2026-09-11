@@ -1,6 +1,7 @@
 import asyncio
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ import rasterio
 from affine import Affine
 
 from services import classification_generation as generation
+from utils.content_hash import resolve_content_sha256
 
 
 def _write_source(path, *, width=6, height=5):
@@ -55,11 +57,15 @@ class RecordingLifecycle:
 
 
 def _request(tmp_path, source_path):
+    weight_path = tmp_path / "weights.pth"
+    weight_path.write_bytes(b"test-weight")
     return generation.GenerationRequest(
         result_id="result-1",
         image_path=source_path,
-        weight_file_path="weights/model.pth",
-        weight_sha256="b" * 64,
+        image_sha256=resolve_content_sha256(source_path).sha256,
+        weight_file_path=str(weight_path),
+        weight_sha256=resolve_content_sha256(weight_path).sha256,
+        inference_parameters={"tile_size": 512, "overlap": 128},
         storage_root=tmp_path / "results",
     )
 
@@ -115,6 +121,23 @@ def test_programmatic_generation_writes_every_streamed_band(tmp_path, monkeypatc
     assert classes[0, 1] == 5
     assert valid[-1, 1] == 1
     assert classes[-1, 1] == 5
+
+
+def test_programmatic_generation_uses_frozen_inference_parameters(
+    tmp_path,
+    monkeypatch,
+):
+    source_path = tmp_path / "source.tif"
+    _write_source(source_path)
+    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    request = replace(
+        _request(tmp_path, source_path),
+        inference_parameters={"tile_size": 4, "overlap": 1},
+    )
+
+    outcome = generation.generate_classification_files(request)
+
+    assert outcome.metrics.effective_tiles == 4
 
 
 def test_database_success_transition_happens_only_after_files_are_readable(

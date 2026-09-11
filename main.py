@@ -21,6 +21,10 @@ from router import identification_results
 from router import change_results
 from crud import change_results as change_result_crud
 from services.generation_lifecycle import recover_expired_processing_results
+from services.change_orchestration import (
+    start_stale_scan,
+    stop_change_orchestration,
+)
 from datetime import datetime, timezone
 
 
@@ -39,9 +43,11 @@ async def lifespan(app: FastAPI):
     await image_lifecycle.recover_cleanup_operations(AsyncSessionLocal)
     upload_sessions.start_tmp_cleanup_task()
     image_lifecycle.start_cleanup_task()
+    start_stale_scan()
     try:
         yield
     finally:
+        await stop_change_orchestration()
         await image_lifecycle.stop_cleanup_task()
         await upload_sessions.stop_tmp_cleanup_task()
         await identification_results.stop_generation_tasks()

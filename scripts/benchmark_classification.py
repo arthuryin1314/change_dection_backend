@@ -8,6 +8,7 @@ from services.classification_generation import (
     GenerationRequest,
     generate_classification_files,
 )
+from utils.classification_contract import inference_parameters
 from utils.content_hash import resolve_content_sha256
 
 
@@ -20,11 +21,14 @@ def main() -> None:
     args = parser.parse_args()
 
     weight_sha256 = resolve_content_sha256(args.weight).sha256
+    image_sha256 = resolve_content_sha256(args.source).sha256
     request = GenerationRequest(
         result_id=args.result_id,
         image_path=args.source,
+        image_sha256=image_sha256,
         weight_file_path=str(args.weight),
         weight_sha256=weight_sha256,
+        inference_parameters=inference_parameters(),
         storage_root=args.output_root,
     )
     started = perf_counter()

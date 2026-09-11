@@ -246,8 +246,10 @@ async def create_identification_result(
         request = GenerationRequest(
             result_id=claim.record.result_id,
             image_path=image.img_path,
+            image_sha256=image_sha256,
             weight_file_path=model.weight_file_path,
             weight_sha256=weight_sha256,
+            inference_parameters=inference_parameters(),
             storage_root=RESULT_STORAGE_ROOT,
         )
         _schedule_generation(request, lease_owner)

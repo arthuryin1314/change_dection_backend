@@ -1,7 +1,10 @@
+import asyncio
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -9,6 +12,7 @@ from uuid import uuid4
 import numpy as np
 import psycopg2
 import pytest
+import rasterio
 from affine import Affine
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -17,8 +21,10 @@ from psycopg2 import sql
 
 load_dotenv()
 
-from config.db_config import get_db
+from config.db_config import AsyncSessionLocal, async_engine, get_db
+from crud import change_results as change_result_crud
 from router import change_results
+from services import classification_generation
 from services.identification_results import ResultIdentity
 from utils.classification_contract import inference_parameters
 from utils.classification_storage import RasterGrid, write_classification_result
@@ -29,6 +35,13 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_POSTGRES_INTEGRATION") != "1",
     reason="需要显式启用本机 PostgreSQL 集成测试",
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_async_connection_pool():
+    asyncio.run(async_engine.dispose(close=False))
+    yield
+    asyncio.run(async_engine.dispose(close=False))
 
 
 def _database_url() -> str:
@@ -43,12 +56,38 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _write_source(path: Path, value: int, grid: RasterGrid) -> None:
+    data = np.full((3, grid.height, grid.width), value, dtype=np.uint8)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=grid.width,
+        height=grid.height,
+        count=3,
+        dtype="uint8",
+        crs=grid.crs,
+        transform=grid.transform,
+        nodata=0,
+    ) as dataset:
+        dataset.write(data)
+
+
+@contextmanager
+def _fake_predictor(weight_file_path, *, weight_sha256):
+    def predict(rgb):
+        return np.where(rgb[:, :, 0] % 2 == 0, 2, 1).astype(np.uint8)
+
+    yield predict
+
+
 def _apply_migration() -> None:
     connection = psycopg2.connect(_database_url())
     try:
         with connection.cursor() as cursor:
             cursor.execute(Path("migrations/003_change_results.sql").read_text(encoding="utf-8"))
             cursor.execute(Path("migrations/004_change_result_analysis.sql").read_text(encoding="utf-8"))
+            cursor.execute(Path("migrations/005_change_orchestration.sql").read_text(encoding="utf-8"))
         connection.commit()
     finally:
         connection.close()
@@ -156,8 +195,8 @@ def _seed(tmp_path: Path):
     )
     before_source = tmp_path / "before-source.tif"
     after_source = tmp_path / "after-source.tif"
-    before_source.write_bytes(b"before-source")
-    after_source.write_bytes(b"after-source")
+    _write_source(before_source, 7, grid)
+    _write_source(after_source, 8, grid)
     before_stored = write_classification_result(
         tmp_path / "classification",
         "before-result",
@@ -257,6 +296,8 @@ def _seed(tmp_path: Path):
             "after_result_id": f"after{suffix[:21]}",
             "before_identity_sha256": before_identity,
             "after_identity_sha256": after_identity,
+            "before_source": before_source,
+            "after_source": after_source,
         }
     finally:
         connection.close()
@@ -272,7 +313,51 @@ def _cleanup(user_id: int) -> None:
         connection.close()
 
 
-def test_migration_004_backfills_legacy_rows_and_is_idempotent():
+def _delete_cached_periods(seeded: dict, periods: tuple[str, ...]) -> None:
+    connection = psycopg2.connect(_database_url())
+    try:
+        with connection.cursor() as cursor:
+            for period in periods:
+                cursor.execute(
+                    "DELETE FROM classification_results WHERE id = %s",
+                    (seeded[f"{period}_result_id"],),
+                )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _mark_period_processing(seeded: dict, period: str) -> None:
+    connection = psycopg2.connect(_database_url())
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE classification_results
+                SET status = 'PROCESSING',
+                    completed_at = NULL,
+                    heartbeat_at = NOW(),
+                    lease_expires_at = NOW() + INTERVAL '5 minutes'
+                WHERE id = %s
+                """,
+                (seeded[f"{period}_result_id"],),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _wait_for_terminal(client: TestClient, request_id: str, timeout: float = 10):
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.get(f"/api/change-results/{request_id}")
+        if response.status_code != 202:
+            return response
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+
+
+def test_migrations_004_and_005_backfill_legacy_rows_and_are_idempotent():
     schema_name = f"change_migration_{uuid4().hex}"
     connection = psycopg2.connect(_database_url())
     try:
@@ -315,6 +400,11 @@ def test_migration_004_backfills_legacy_rows_and_is_idempotent():
             )
             cursor.execute(migration)
             cursor.execute(migration)
+            orchestration_migration = Path(
+                "migrations/005_change_orchestration.sql"
+            ).read_text(encoding="utf-8")
+            cursor.execute(orchestration_migration)
+            cursor.execute(orchestration_migration)
             cursor.execute(
                 """
                 SELECT calculation_version, grid_policy_version,
@@ -342,6 +432,16 @@ def test_migration_004_backfills_legacy_rows_and_is_idempotent():
                 "calculation_version": "NO",
                 "grid_policy_version": "NO",
             }
+            cursor.execute(
+                """
+                SELECT phase, submitted_inputs->>'before_image_id',
+                       submitted_inputs->>'after_image_id'
+                FROM change_results
+                """
+            )
+            assert cursor.fetchone() == ("SUCCEEDED", "1", "2")
+            cursor.execute("SELECT request_fingerprint FROM change_requests")
+            assert cursor.fetchone()[0].startswith("legacy:")
     finally:
         connection.rollback()
         with connection.cursor() as cursor:
@@ -363,10 +463,6 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
         "before_image_id": seeded["before_image_id"],
         "after_image_id": seeded["after_image_id"],
         "model_id": seeded["model_id"],
-        "before_result_id": seeded["before_result_id"],
-        "before_identity_sha256": seeded["before_identity_sha256"],
-        "after_result_id": seeded["after_result_id"],
-        "after_identity_sha256": seeded["after_identity_sha256"],
     }
     app = FastAPI()
     app.include_router(change_results.router)
@@ -375,9 +471,16 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
     try:
         with TestClient(app) as client:
             created = client.post("/api/change-results", json=payload)
-            assert created.status_code == 200
-            data = created.json()["data"]
-            assert data["status"] == "SUCCEEDED"
+            assert created.status_code == 202
+            deadline = time.monotonic() + 10
+            while True:
+                fetched = client.get(f"/api/change-results/{request_id}")
+                if fetched.status_code == 200:
+                    break
+                assert fetched.status_code == 202
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            data = fetched.json()["data"]
             assert len(data["matrix_m2"]) == 6
             assert data["matrix_m2"][0][1] > 0
             assert data["matrix_m2"][1][1] > 0
@@ -396,7 +499,7 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
             assert fetched.json()["data"] == data
 
             duplicate = reloaded_client.post("/api/change-results", json=payload)
-            assert duplicate.status_code == 200
+            assert duplicate.status_code == 202
             assert duplicate.json()["data"] == data
 
             conflicting = reloaded_client.post(
@@ -411,5 +514,537 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
             )
             denied = reloaded_client.get(f"/api/change-results/{request_id}")
             assert denied.status_code == 404
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+@pytest.mark.parametrize(
+    ("missing_periods", "expected_generations"),
+    [
+        ((), 0),
+        (("after",), 1),
+        (("before", "after"), 2),
+    ],
+)
+
+
+def test_postgres_orchestration_reuses_or_generates_each_missing_period(
+    tmp_path,
+    monkeypatch,
+    missing_periods,
+    expected_generations,
+):
+    from services import change_orchestration
+
+    seeded = _seed(tmp_path)
+    _delete_cached_periods(seeded, missing_periods)
+    model_loads = []
+
+    @contextmanager
+    def recording_predictor(weight_file_path, *, weight_sha256):
+        model_loads.append((weight_file_path, weight_sha256))
+
+        def predict(rgb):
+            return np.where(rgb[:, :, 0] % 2 == 0, 2, 1).astype(np.uint8)
+
+        yield predict
+
+    monkeypatch.setattr(
+        classification_generation,
+        "model_tile_predictor",
+        recording_predictor,
+    )
+    monkeypatch.setenv(
+        "CLASSIFICATION_RESULT_DIR",
+        str(tmp_path / "generated-classifications"),
+    )
+    monkeypatch.setattr(
+        change_orchestration,
+        "SNAPSHOT_ROOT",
+        tmp_path / "snapshots",
+    )
+    request_id = str(uuid4())
+    payload = {
+        "request_id": request_id,
+        "before_image_id": seeded["before_image_id"],
+        "after_image_id": seeded["after_image_id"],
+        "model_id": seeded["model_id"],
+    }
+    app = FastAPI()
+    app.include_router(change_results.router)
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=seeded["user_id"]
+    )
+
+    try:
+        with TestClient(app) as client:
+            assert client.post("/api/change-results", json=payload).status_code == 202
+            completed = _wait_for_terminal(client, request_id)
+
+        assert completed.status_code == 200
+        assert completed.json()["data"]["periods"]["before"]["status"] == "SUCCEEDED"
+        assert completed.json()["data"]["periods"]["after"]["status"] == "SUCCEEDED"
+        assert len(model_loads) == expected_generations
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+def test_postgres_concurrent_submission_claims_once_at_application_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    seeded = _seed(tmp_path)
+    barrier = asyncio.Barrier(2)
+    original_claim = change_result_crud.claim_submission
+    scheduled = []
+
+    async def synchronized_claim(*args, **kwargs):
+        await barrier.wait()
+        return await original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(
+        change_results.crud_results,
+        "claim_submission",
+        synchronized_claim,
+    )
+    monkeypatch.setattr(
+        change_results,
+        "schedule_change_orchestration",
+        lambda result_id, user_id, owner: scheduled.append(
+            (result_id, user_id, owner)
+        ),
+    )
+
+    async def submit(request_id):
+        async with AsyncSessionLocal() as db:
+            return await change_results.create_change_result(
+                change_results.CreateChangeResultRequest(
+                    request_id=request_id,
+                    before_image_id=seeded["before_image_id"],
+                    after_image_id=seeded["after_image_id"],
+                    model_id=seeded["model_id"],
+                ),
+                db=db,
+                current_user=SimpleNamespace(id=seeded["user_id"]),
+            )
+
+    request_ids = (uuid4(), uuid4())
+    try:
+        async def submit_both():
+            return await asyncio.gather(
+                submit(request_ids[0]),
+                submit(request_ids[1]),
+            )
+
+        responses = asyncio.run(submit_both())
+        assert [response.status_code for response in responses] == [202, 202]
+        assert len(scheduled) == 1
+
+        connection = psycopg2.connect(_database_url())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT count(DISTINCT cr.change_result_id), count(*)
+                    FROM change_requests cr
+                    WHERE cr.user_id = %s AND cr.request_id IN (%s, %s)
+                    """,
+                    (
+                        seeded["user_id"],
+                        str(request_ids[0]),
+                        str(request_ids[1]),
+                    ),
+                )
+                assert cursor.fetchone() == (1, 2)
+        finally:
+            connection.close()
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+def test_postgres_full_identity_collision_rebinds_requests_to_one_winner(tmp_path):
+    seeded = _seed(tmp_path)
+    request_ids = (str(uuid4()), str(uuid4()))
+    owners = (uuid4().hex, uuid4().hex)
+    submitted = {
+        "before_image_id": seeded["before_image_id"],
+        "after_image_id": seeded["after_image_id"],
+        "model_id": seeded["model_id"],
+    }
+
+    async def scenario():
+        claims = []
+        for index in range(2):
+            async with AsyncSessionLocal() as db:
+                claim = await change_result_crud.claim_submission(
+                    db,
+                    request_id=request_ids[index],
+                    request_fingerprint=hashlib.sha256(
+                        request_ids[index].encode()
+                    ).hexdigest(),
+                    preparation_key=hashlib.sha256(
+                        f"prep-{request_ids[index]}".encode()
+                    ).hexdigest(),
+                    submitted_inputs=submitted,
+                    user_id=seeded["user_id"],
+                    owner=owners[index],
+                    now=datetime.now(timezone.utc),
+                )
+                await db.commit()
+                claims.append(claim)
+
+        barrier = asyncio.Barrier(2)
+
+        async def freeze(index):
+            await barrier.wait()
+            async with AsyncSessionLocal() as db:
+                return await change_result_crud.set_frozen_identity(
+                    db,
+                    result_id=claims[index].row.id,
+                    user_id=seeded["user_id"],
+                    owner=owners[index],
+                    orchestration_identity_sha256="f" * 64,
+                    before_identity_sha256="b" * 64,
+                    after_identity_sha256="a" * 64,
+                    frozen_inputs={"test": index},
+                    now=datetime.now(timezone.utc),
+                )
+
+        return claims, await asyncio.gather(freeze(0), freeze(1))
+
+    try:
+        claims, winners = asyncio.run(scenario())
+        assert winners[0].id == winners[1].id
+
+        connection = psycopg2.connect(_database_url())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status, phase, count(*)
+                    FROM change_results
+                    WHERE id IN (%s, %s)
+                    GROUP BY status, phase
+                    ORDER BY status, phase
+                    """,
+                    (claims[0].row.id, claims[1].row.id),
+                )
+                assert cursor.fetchall() == [
+                    ("FAILED", "MERGED", 1),
+                    ("PROCESSING", "WAITING_BEFORE", 1),
+                ]
+                cursor.execute(
+                    """
+                    SELECT count(DISTINCT change_result_id), count(*)
+                    FROM change_requests
+                    WHERE user_id = %s AND request_id IN (%s, %s)
+                    """,
+                    (seeded["user_id"], request_ids[0], request_ids[1]),
+                )
+                assert cursor.fetchone() == (1, 2)
+        finally:
+            connection.close()
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+def test_postgres_changed_image_bytes_do_not_reuse_old_classification(
+    tmp_path,
+    monkeypatch,
+):
+    from services import change_orchestration
+
+    seeded = _seed(tmp_path)
+    _write_source(
+        seeded["after_source"],
+        9,
+        RasterGrid(
+            width=4,
+            height=2,
+            crs="EPSG:4326",
+            transform=Affine(0.01, 0, 110, 0, -0.01, 30),
+        ),
+    )
+    monkeypatch.setattr(
+        classification_generation,
+        "model_tile_predictor",
+        _fake_predictor,
+    )
+    monkeypatch.setenv(
+        "CLASSIFICATION_RESULT_DIR",
+        str(tmp_path / "generated-classifications"),
+    )
+    monkeypatch.setattr(
+        change_orchestration,
+        "SNAPSHOT_ROOT",
+        tmp_path / "snapshots",
+    )
+    request_id = str(uuid4())
+    app = FastAPI()
+    app.include_router(change_results.router)
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=seeded["user_id"]
+    )
+
+    try:
+        with TestClient(app) as client:
+            submitted = client.post(
+                "/api/change-results",
+                json={
+                    "request_id": request_id,
+                    "before_image_id": seeded["before_image_id"],
+                    "after_image_id": seeded["after_image_id"],
+                    "model_id": seeded["model_id"],
+                },
+            )
+            assert submitted.status_code == 202
+            completed = _wait_for_terminal(client, request_id)
+
+        assert completed.status_code == 200
+        assert (
+            completed.json()["data"]["after"]["identity_sha256"]
+            != seeded["after_identity_sha256"]
+        )
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+def test_postgres_identification_failure_can_retry_with_new_request_id(
+    tmp_path,
+    monkeypatch,
+):
+    from services import change_orchestration
+
+    seeded = _seed(tmp_path)
+    _delete_cached_periods(seeded, ("after",))
+
+    @contextmanager
+    def failing_predictor(weight_file_path, *, weight_sha256):
+        def predict(rgb):
+            raise RuntimeError("integration inference failure")
+
+        yield predict
+
+    monkeypatch.setattr(
+        classification_generation,
+        "model_tile_predictor",
+        failing_predictor,
+    )
+    monkeypatch.setenv(
+        "CLASSIFICATION_RESULT_DIR",
+        str(tmp_path / "generated-classifications"),
+    )
+    monkeypatch.setattr(
+        change_orchestration,
+        "SNAPSHOT_ROOT",
+        tmp_path / "snapshots",
+    )
+    request_id = str(uuid4())
+    retry_id = str(uuid4())
+    app = FastAPI()
+    app.include_router(change_results.router)
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=seeded["user_id"]
+    )
+
+    try:
+        with TestClient(app) as client:
+            assert client.post(
+                "/api/change-results",
+                json={
+                    "request_id": request_id,
+                    "before_image_id": seeded["before_image_id"],
+                    "after_image_id": seeded["after_image_id"],
+                    "model_id": seeded["model_id"],
+                },
+            ).status_code == 202
+            failed = _wait_for_terminal(client, request_id)
+            assert failed.status_code == 422
+            assert (
+                failed.json()["data"]["error_code"]
+                == "IDENTIFICATION_EXECUTION_FAILED"
+            )
+            assert failed.json()["data"]["periods"]["after"]["status"] == "FAILED"
+
+            seeded["before_source"].unlink()
+            monkeypatch.setattr(
+                classification_generation,
+                "model_tile_predictor",
+                _fake_predictor,
+            )
+            retried = client.post(
+                f"/api/change-results/{request_id}/retry",
+                json={"request_id": retry_id},
+            )
+            assert retried.status_code == 202
+            completed = _wait_for_terminal(client, retry_id)
+
+        assert completed.status_code == 200
+        assert completed.json()["data"]["request_id"] == retry_id
+        assert (
+            completed.json()["data"]["before"]["identity_sha256"]
+            == seeded["before_identity_sha256"]
+        )
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+def test_postgres_targeted_expiry_marks_the_request_retryable(tmp_path):
+    seeded = _seed(tmp_path)
+    request_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+
+    async def scenario():
+        async with AsyncSessionLocal() as db:
+            await change_result_crud.claim_submission(
+                db,
+                request_id=request_id,
+                request_fingerprint="f" * 64,
+                preparation_key="p" * 64,
+                submitted_inputs={
+                    "before_image_id": seeded["before_image_id"],
+                    "after_image_id": seeded["after_image_id"],
+                    "model_id": seeded["model_id"],
+                },
+                user_id=seeded["user_id"],
+                owner=uuid4().hex,
+                now=now - timedelta(minutes=3),
+            )
+            await db.commit()
+        async with AsyncSessionLocal() as db:
+            expired = await change_result_crud.expire_request(
+                db,
+                request_id=request_id,
+                user_id=seeded["user_id"],
+                now=now,
+            )
+            await db.commit()
+            row = await change_result_crud.get_by_request(
+                db,
+                request_id,
+                seeded["user_id"],
+            )
+            return expired, row
+
+    try:
+        expired, row = asyncio.run(scenario())
+
+        assert expired == 1
+        assert row.error_code == "CHANGE_RESULT_INTERRUPTED"
+        assert row.error_data["retryable"] is True
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+def test_postgres_matrix_retry_reuses_both_periods_after_pipeline_upgrade(
+    tmp_path,
+    monkeypatch,
+):
+    from services import change_orchestration
+
+    seeded = _seed(tmp_path)
+    original_compute = change_orchestration.compute_transition_matrix_m2
+
+    def fail_matrix(*_args):
+        raise RuntimeError("integration matrix failure")
+
+    monkeypatch.setattr(
+        change_orchestration,
+        "compute_transition_matrix_m2",
+        fail_matrix,
+    )
+    monkeypatch.setattr(
+        change_orchestration,
+        "SNAPSHOT_ROOT",
+        tmp_path / "snapshots",
+    )
+    request_id = str(uuid4())
+    retry_id = str(uuid4())
+    app = FastAPI()
+    app.include_router(change_results.router)
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=seeded["user_id"]
+    )
+
+    try:
+        with TestClient(app) as client:
+            assert client.post(
+                "/api/change-results",
+                json={
+                    "request_id": request_id,
+                    "before_image_id": seeded["before_image_id"],
+                    "after_image_id": seeded["after_image_id"],
+                    "model_id": seeded["model_id"],
+                },
+            ).status_code == 202
+            failed = _wait_for_terminal(client, request_id)
+            assert failed.status_code == 500
+
+            monkeypatch.setattr(
+                change_orchestration,
+                "compute_transition_matrix_m2",
+                original_compute,
+            )
+            monkeypatch.setattr(
+                change_orchestration,
+                "CLASSIFICATION_SCHEME_VERSION",
+                "land-cover-6/v2",
+            )
+            assert client.post(
+                f"/api/change-results/{request_id}/retry",
+                json={"request_id": retry_id},
+            ).status_code == 202
+            completed = _wait_for_terminal(client, retry_id)
+
+        assert completed.status_code == 200
+        assert (
+            completed.json()["data"]["before"]["identity_sha256"]
+            == seeded["before_identity_sha256"]
+        )
+        assert (
+            completed.json()["data"]["after"]["identity_sha256"]
+            == seeded["after_identity_sha256"]
+        )
+    finally:
+        _cleanup(seeded["user_id"])
+
+
+def test_postgres_waiting_for_owned_identification_has_a_busy_budget(
+    tmp_path,
+    monkeypatch,
+):
+    from services import change_orchestration
+
+    seeded = _seed(tmp_path)
+    _mark_period_processing(seeded, "after")
+    monkeypatch.setattr(change_orchestration, "IDENTIFICATION_WAIT_SECONDS", 0)
+    monkeypatch.setattr(
+        change_orchestration,
+        "SNAPSHOT_ROOT",
+        tmp_path / "snapshots",
+    )
+    request_id = str(uuid4())
+    app = FastAPI()
+    app.include_router(change_results.router)
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=seeded["user_id"]
+    )
+
+    try:
+        with TestClient(app) as client:
+            assert client.post(
+                "/api/change-results",
+                json={
+                    "request_id": request_id,
+                    "before_image_id": seeded["before_image_id"],
+                    "after_image_id": seeded["after_image_id"],
+                    "model_id": seeded["model_id"],
+                },
+            ).status_code == 202
+            failed = _wait_for_terminal(client, request_id)
+
+        assert failed.status_code == 409
+        assert failed.json()["data"]["error_code"] == "IDENTIFICATION_RESULT_BUSY"
+        assert failed.json()["data"]["retryable"] is True
     finally:
         _cleanup(seeded["user_id"])
