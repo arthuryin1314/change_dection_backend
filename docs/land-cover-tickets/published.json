@@ -26,7 +26,9 @@
     "number": 11,
     "file": "04-auto-identification.md",
     "title": "4b：自动补算编排、状态查询与失败重试",
-    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/11"
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/11",
+    "status": "completed",
+    "completionComment": "https://github.com/arthuryin1314/change_dection_backend/issues/11#issuecomment-5628181824"
   },
   "2": {
     "number": 9,
@@ -42,7 +44,9 @@
     "number": 12,
     "file": "05-history.md",
     "title": "5：识别与变化检测历史列表及结果查看",
-    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/12"
+    "url": "https://github.com/arthuryin1314/change_dection_backend/issues/12",
+    "status": "completed",
+    "completionComment": "https://github.com/arthuryin1314/change_dection_backend/issues/12#issuecomment-5629832310"
   },
   "1a": {
     "number": 7,

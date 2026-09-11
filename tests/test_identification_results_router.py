@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import pytest
+from rasterio.crs import CRS as RasterioCRS
+from rasterio.transform import array_bounds
 from affine import Affine
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/test")
@@ -248,8 +250,8 @@ def test_post_scopes_both_sources_to_current_user():
     assert image_lookup.await_args.args[1:] == (999, 7)
 
 
-def _stored_result(tmp_path, *, status=SUCCEEDED):
-    grid = RasterGrid(
+def _stored_result(tmp_path, *, status=SUCCEEDED, grid=None):
+    grid = grid if grid is not None else RasterGrid(
         width=2,
         height=1,
         crs="EPSG:4326",
@@ -285,12 +287,12 @@ def _stored_result(tmp_path, *, status=SUCCEEDED):
         failure_detail=None,
         classes_path=str(stored.classes_path),
         valid_mask_path=str(stored.valid_mask_path),
-        crs="EPSG:4326",
-        transform=[0.01, 0, 110, 0, -0.01, 30],
-        raster_width=2,
-        raster_height=1,
-        resolution=[0.01, 0.01],
-        bounds=[110, 29.99, 110.02, 30],
+        crs=grid.crs,
+        transform=list(grid.transform)[:6],
+        raster_width=grid.width,
+        raster_height=grid.height,
+        resolution=[abs(grid.transform.a), abs(grid.transform.e)],
+        bounds=list(array_bounds(grid.height, grid.width, grid.transform)),
         class_area_m2=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         area_status="SUCCEEDED",
         area_completed_at=datetime(2026, 9, 6, tzinfo=timezone.utc),
@@ -868,3 +870,75 @@ def test_resolve_maps_busy_result_lock_to_retryable_409():
 
     assert response.status_code == 409
     assert response.json()["detail"] == "等待识别结果文件锁超时"
+
+
+@pytest.mark.parametrize("crs,transform", [
+    ("EPSG:4528", Affine(0.8, 0, 40558753.6, 0, -0.8, 3571463.2)),
+    (RasterioCRS.from_epsg(4528).to_wkt(), Affine(0.8, 0, 40558753.6, 0, -0.8, 3571463.2)),
+    ("EPSG:4326", Affine(0.01, 0, 110, 0, -0.01, 30)),
+])
+def test_history_render_grid_produces_reprojected_classification_png(tmp_path, crs, transform):
+    client, db = _make_client()
+    row = _stored_result(tmp_path, grid=RasterGrid(width=2, height=1, crs=crs, transform=transform))
+    with patch.object(identification_results.crud_results, "get_succeeded_history_by_id", new=AsyncMock(return_value=row)), patch.object(
+        identification_results.crud_results, "get_result_by_id", new=AsyncMock(return_value=row),
+    ):
+        detail = client.get("/api/identification-results/history/result-1")
+        assert detail.status_code == 200
+        data = detail.json()["data"]
+        assert data["grid"]["crs"] == crs
+        grid = data["render_grid"]
+        assert grid["crs"] == "EPSG:3857"
+        left, bottom, right, top = grid["bounds"]
+        assert 12_000_000 < left < right < 14_000_000
+        assert 3_000_000 < bottom < top < 4_500_000
+        image = client.get("/api/identification-results/result-1/render", params={
+            "bbox": ",".join(map(str, grid["bounds"])), "srs": grid["crs"],
+            "width": 200, "height": 100, "classes": [0, 1],
+        })
+    assert image.status_code == 200
+    pixels = np.array(Image.open(io.BytesIO(image.content)).convert("RGBA"))
+    opaque = pixels[pixels[:, :, 3] > 0]
+    assert {tuple(pixel) for pixel in opaque} == {(0, 0, 0, 180), (0, 0, 255, 180)}
+    assert not db.committed
+
+
+@pytest.mark.parametrize("crs,bounds", [
+    ("EPSG:NOT_REAL", [110, 29, 111, 30]),
+    (None, [110, 29, 111, 30]),
+    ("EPSG:4326", [110, 95, 111, 96]),
+    ("EPSG:4326", None),
+])
+def test_history_projection_failure_keeps_other_detail_readable(tmp_path, crs, bounds):
+    client, db = _make_client()
+    row = _stored_result(tmp_path)
+    row.crs = crs
+    row.bounds = bounds
+    with patch.object(identification_results.crud_results, "get_succeeded_history_by_id", new=AsyncMock(return_value=row)):
+        response = client.get("/api/identification-results/history/result-1")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == SUCCEEDED
+    assert data["class_area_m2"] == row.class_area_m2
+    assert data["render_grid"] is None
+    assert data["render_error"] == "分类图坐标系或范围无法转换为地图坐标，请检查空间网格信息"
+    assert not db.committed
+
+
+@pytest.mark.parametrize("crs,expected", [
+    ("EPSG:4326", "EPSG:4326 · WGS 84"),
+    (RasterioCRS.from_epsg(4528).to_wkt(), "EPSG:4528 · CGCS2000 / 3-degree Gauss-Kruger zone 40"),
+    ('LOCAL_CS["Local survey grid",UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH]]', "Local survey grid"),
+    ("invalid projection", "无法识别的坐标系"),
+    (None, "未记录"),
+])
+def test_history_shows_crs_label_and_preserves_original_definition(tmp_path, crs, expected):
+    client, _ = _make_client()
+    row = _stored_result(tmp_path)
+    row.crs = crs
+    with patch.object(identification_results.crud_results, "get_succeeded_history_by_id", new=AsyncMock(return_value=row)):
+        response = client.get("/api/identification-results/history/result-1")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["crs_label"] == expected
+    assert data["grid"]["crs"] == crs

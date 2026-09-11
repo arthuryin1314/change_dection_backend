@@ -2,14 +2,10 @@
 
 父规格：[Issue #6](https://github.com/arthuryin1314/change_dection_backend/issues/6)。父规格已同步 2026-09-08 面积展示位置修订。
 
-用户已批准拆分，确认实际影像主要同网格，因此网格统一排在后面。下表顺序为实施优先级，依赖列才是硬阻塞关系。
+用户已批准拆分，确认实际影像主要同网格，因此网格统一排在后面。全部实施子任务已完成；父规格 #6 保持开启，等待产品验收。
 
-| 切片 | 已发布任务 | 硬依赖 |
-| --- | --- | --- |
-| 4b | [#11 自动补算、状态查询与重试](https://github.com/arthuryin1314/change_dection_backend/issues/11) | #9、#7（明确列出流水线依赖） |
-| 5 | [#12 识别与变化检测历史](https://github.com/arthuryin1314/change_dection_backend/issues/12) | #9、#8 |
 
-待办仅为 #11、#12；#7、#8、#9、#13 已完成。#9 的真实异图页面及性能缺口已在 #13 后补验；保留原部分验收记录作为历史，不重复调度已完成任务。
+#7、#8、#9、#11、#12、#13 均已完成，#10 已并入 #9。#9 的真实异图页面及性能缺口已在 #13 后补验；保留原部分验收记录作为历史，不重复调度已完成任务。
 
 第一个面向用户的可发布单元是 #7 + #8。#9 整卡依赖 #8 的只读解析与选择状态，矩阵计算核心仍只依赖 #7；后端像元地表面积算法与容差契约唯一归 #7，前端单位换算唯一归 #8。
 
@@ -41,10 +37,21 @@
 
 
 
-## 2026-09-10 收尾状态（以此为当前状态）
+## 2026-09-10 收尾状态（历史记录）
 
 - #13 已 Completed：[完成评论](https://github.com/arthuryin1314/change_dection_backend/issues/13#issuecomment-5618854053)。
 - #9 已 Completed：[异图补验评论](https://github.com/arthuryin1314/change_dection_backend/issues/9#issuecomment-5618854695)。此前部分通过说明为历史结论。
 - 后端本地 feature-compute-area 为 f03bf1e，前端为 9c57c5c，均包含 #9/#13；远端仍为 fe5c734/ed8915b。本次未提交收尾文档、未推送，不能把 Issue 关闭等同于新代码已发布。
 - #11、#12 原生依赖保留；本次不自动启动后续任务。
 
+
+## 2026-09-11 最新调度状态
+
+#11 已 Completed：[完成评论](https://github.com/arthuryin1314/change_dection_backend/issues/11#issuecomment-5628181824)。人工验收通过，两端 issue11 提交已核对在远端；默认分支合并与部署不作为已核验事实。待办仅剩 #12；不自动启动。前文其他待办列表为历史状态。
+
+
+## 2026-09-11 产品验收待办（当前状态）
+
+#12 已发布[完成评论](https://github.com/arthuryin1314/change_dection_backend/issues/12#issuecomment-5629832310)并以 Completed 关闭。#7、#8、#9、#11、#12、#13 全部实施完成，#10 已并入 #9；前文阶段待办为历史记录。
+
+父规格 #6 按用户要求保持 OPEN，等待产品验收，不自动关闭。Issue 完成状态不代表默认分支合并或部署已经核验。

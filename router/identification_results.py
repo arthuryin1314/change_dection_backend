@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,8 @@ from uuid import uuid4
 from affine import Affine
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
+from rasterio.errors import CRSError
+from rasterio.warp import transform_bounds
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.db_config import AsyncSessionLocal, get_db
@@ -370,6 +373,21 @@ async def get_identification_history(
         raise HTTPException(status_code=404, detail="历史记录不存在或无权访问")
     data = _serialize_result(row)
     data["render_status"] = _history_render_status(row)
+    data["render_grid"] = None
+    data["render_error"] = None
+    if data["render_status"] == "AVAILABLE":
+        try:
+            if row.crs is None or row.bounds is None:
+                raise ValueError("缺少空间网格信息")
+            bounds = await asyncio.to_thread(
+                transform_bounds, row.crs, "EPSG:3857", *row.bounds, densify_pts=21,
+            )
+            left, bottom, right, top = bounds
+            if not all(math.isfinite(value) for value in bounds) or left >= right or bottom >= top:
+                raise ValueError("展示范围无效")
+            data["render_grid"] = {"crs": "EPSG:3857", "bounds": list(bounds)}
+        except (CRSError, ValueError, TypeError):
+            data["render_error"] = "分类图坐标系或范围无法转换为地图坐标，请检查空间网格信息"
     return api_response(200, "查询成功", data)
 
 
