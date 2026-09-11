@@ -1,7 +1,7 @@
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from sqlalchemy import exists, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from models.change_results import ChangeRequest, ChangeResult
 from models.classification_results import ClassificationResult
+from crud.succeeded_history import get_for_user, list_for_user
 from utils.change_result_errors import CHANGE_RESULT_INTERRUPTED
 from utils.transition_matrix import CALCULATION_VERSION, GRID_POLICY_VERSION
 
@@ -54,6 +55,30 @@ async def get_by_request(db: AsyncSession, request_id: str, user_id: int):
 async def get_by_id(db: AsyncSession, result_id: int):
     result = await db.execute(select(ChangeResult).where(ChangeResult.id == result_id))
     return result.scalar_one_or_none()
+
+
+async def list_succeeded_history(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    offset: int,
+    limit: int,
+) -> tuple[list[ChangeResult], int]:
+    return await list_for_user(
+        db,
+        ChangeResult,
+        user_id,
+        offset=offset,
+        limit=limit,
+    )
+
+
+async def get_succeeded_history_by_id(
+    db: AsyncSession,
+    result_id: int,
+    user_id: int,
+) -> ChangeResult | None:
+    return await get_for_user(db, ChangeResult, result_id, user_id)
 
 
 async def get_request_binding(db: AsyncSession, request_id: str, user_id: int):

@@ -34,6 +34,7 @@ from utils.classification_storage import RasterGrid, StoredClassification, valid
 from utils.content_hash import ContentHash, resolve_content_sha256
 from utils.get_user_by_token import get_current_user
 from utils.response import api_response
+from utils.result_source import result_source_snapshot
 
 
 router = APIRouter(prefix="/api/identification-results", tags=["identification-results"])
@@ -222,6 +223,12 @@ async def create_identification_result(
         db,
         source_image_id=image.id,
         source_model_id=model.id,
+        source_snapshot=result_source_snapshot(
+            image.id,
+            image.image_name,
+            model.id,
+            model.model_name,
+        ),
     )
     claim = await claim_identification_result(store, identity, lease_owner, _utc_now())
     await db.commit()
@@ -277,6 +284,7 @@ def _serialize_result(row) -> dict:
         "status": row.status,
         "source_image_id": row.source_image_id,
         "source_model_id": row.source_model_id,
+        "source": row.source_snapshot,
         "identity_sha256": row.identity_sha256,
         "image_content_sha256": row.image_content_sha256,
         "weight_content_sha256": row.weight_content_sha256,
@@ -303,6 +311,66 @@ def _serialize_result(row) -> dict:
             "bounds": row.bounds,
         }
     return data
+
+
+def _history_render_status(row) -> str:
+    if row.classes_path is None or row.valid_mask_path is None:
+        return "UNAVAILABLE"
+    if not Path(row.classes_path).is_file() or not Path(row.valid_mask_path).is_file():
+        return "UNAVAILABLE"
+    return "AVAILABLE"
+
+
+def _serialize_history_item(row) -> dict:
+    return {
+        "result_id": row.id,
+        "source": row.source_snapshot,
+        "completed_at": _iso(row.completed_at),
+        "area_status": row.area_status,
+    }
+
+
+@router.get("/history")
+async def list_identification_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    rows, total = await crud_results.list_succeeded_history(
+        db,
+        current_user.id,
+        offset=(page - 1) * page_size,
+        limit=page_size,
+    )
+    return api_response(
+        200,
+        "查询成功",
+        {
+            "items": [_serialize_history_item(row) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+
+
+@router.get("/history/{result_id}")
+async def get_identification_history(
+    result_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    row = await crud_results.get_succeeded_history_by_id(
+        db,
+        result_id,
+        current_user.id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="历史记录不存在或无权访问")
+    data = _serialize_result(row)
+    data["render_status"] = _history_render_status(row)
+    return api_response(200, "查询成功", data)
 
 
 async def resolve_identification_for_change(
@@ -334,6 +402,12 @@ async def resolve_identification_for_change(
     )
     source_image_id = image.id
     source_model_id = model.id
+    source_snapshot = result_source_snapshot(
+        image.id,
+        image.image_name,
+        model.id,
+        model.model_name,
+    )
     await db.rollback()
     image_hash, weight_hash = await _calculate_content_hashes(
         image_source,
@@ -349,6 +423,7 @@ async def resolve_identification_for_change(
         db,
         source_image_id=source_image_id,
         source_model_id=source_model_id,
+        source_snapshot=source_snapshot,
     )
     matched = await store.get_by_identity(user_id, identity.sha256())
     if matched is None:

@@ -91,7 +91,16 @@ def test_area_columns_and_migration_share_the_same_storage_contract():
 
 def test_insert_claim_uses_postgresql_conflict_handling_instead_of_check_then_insert():
     session = RecordingSession(None)
-    store = SqlAlchemyClaimStore(session, source_image_id=11, source_model_id=12)
+    snapshot = {
+        "image": {"id": 11, "name": "计算时影像"},
+        "model": {"id": 12, "name": "计算时模型"},
+    }
+    store = SqlAlchemyClaimStore(
+        session,
+        source_image_id=11,
+        source_model_id=12,
+        source_snapshot=snapshot,
+    )
     now = datetime(2026, 9, 6, tzinfo=timezone.utc)
 
     result = asyncio.run(
@@ -107,11 +116,22 @@ def test_insert_claim_uses_postgresql_conflict_handling_instead_of_check_then_in
     assert result is None
     assert "ON CONFLICT (user_id, identity_sha256) DO NOTHING" in sql
     assert "RETURNING classification_results" in sql
+    assert snapshot in session.statements[0].compile(
+        dialect=postgresql.dialect()
+    ).params.values()
 
 
 def test_stale_takeover_is_one_conditional_update():
     session = RecordingSession(None)
-    store = SqlAlchemyClaimStore(session, source_image_id=11, source_model_id=12)
+    store = SqlAlchemyClaimStore(
+        session,
+        source_image_id=11,
+        source_model_id=12,
+        source_snapshot={
+            "image": {"id": 11, "name": "计算时影像"},
+            "model": {"id": 12, "name": "计算时模型"},
+        },
+    )
     now = datetime(2026, 9, 6, tzinfo=timezone.utc)
 
     result = asyncio.run(

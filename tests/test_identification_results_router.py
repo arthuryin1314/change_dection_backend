@@ -77,6 +77,7 @@ def _sources():
     image = SimpleNamespace(
         id=1,
         user_id=7,
+        image_name="计算时影像",
         img_path=__file__,
         content_sha256="a" * 64,
         content_sha256_size=os.path.getsize(__file__),
@@ -85,6 +86,7 @@ def _sources():
     model = SimpleNamespace(
         id=11,
         user_id=7,
+        model_name="计算时模型",
         model_type="semantic_segmentation",
         framework="PyTorch",
         weight_file_path=str(weight_path),
@@ -142,6 +144,40 @@ def test_post_returns_202_and_schedules_only_after_database_commit():
     }
     assert db.scheduled_after_commit is True
     scheduled.assert_called_once()
+
+
+def test_post_captures_source_names_outside_result_identity():
+    client, _ = _make_client()
+    image, model = _sources()
+    store = Mock()
+
+    with patch.object(
+        identification_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ), patch.object(
+        identification_results.crud_ml_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        identification_results,
+        "SqlAlchemyClaimStore",
+        return_value=store,
+    ) as store_type, patch.object(
+        identification_results,
+        "claim_identification_result",
+        new=AsyncMock(return_value=_claim()),
+    ), patch.object(identification_results, "_schedule_generation"):
+        response = client.post(
+            "/api/identification-results",
+            json={"image_id": 1, "model_id": 11},
+        )
+
+    assert response.status_code == 202
+    assert store_type.call_args.kwargs["source_snapshot"] == {
+        "image": {"id": 1, "name": "计算时影像"},
+        "model": {"id": 11, "name": "计算时模型"},
+    }
 
 
 def test_old_generation_callback_does_not_unregister_replacement_task():
@@ -231,6 +267,10 @@ def _stored_result(tmp_path, *, status=SUCCEEDED):
         user_id=7,
         source_image_id=1,
         source_model_id=11,
+        source_snapshot={
+            "image": {"id": 1, "name": "计算时影像"},
+            "model": {"id": 11, "name": "计算时模型"},
+        },
         identity_sha256="c" * 64,
         image_content_sha256="a" * 64,
         weight_content_sha256="b" * 64,
@@ -294,6 +334,66 @@ def test_resolve_returns_complete_identity_match_without_writing_database(tmp_pa
     assert data["result"]["class_area_m2"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert db.flushed is False
     assert db.committed is False
+
+
+def test_history_lists_saved_results_and_reads_detail_without_writing(tmp_path):
+    client, db = _make_client()
+    row = _stored_result(tmp_path)
+
+    with patch.object(
+        identification_results.crud_results,
+        "list_succeeded_history",
+        new=AsyncMock(return_value=([row], 1)),
+        create=True,
+    ), patch.object(
+        identification_results.crud_results,
+        "get_succeeded_history_by_id",
+        new=AsyncMock(return_value=row),
+        create=True,
+    ):
+        listing = client.get("/api/identification-results/history")
+        detail = client.get("/api/identification-results/history/result-1")
+
+    assert listing.status_code == 200
+    assert listing.json()["data"] == {
+        "items": [{
+            "result_id": "result-1",
+            "source": row.source_snapshot,
+            "completed_at": "2026-09-06T00:00:00+00:00",
+            "area_status": "SUCCEEDED",
+        }],
+        "total": 1,
+        "page": 1,
+        "page_size": 20,
+    }
+    assert detail.status_code == 200
+    assert detail.json()["data"]["source"] == row.source_snapshot
+    assert detail.json()["data"]["render_status"] == "AVAILABLE"
+    assert db.committed is False
+    assert db.flushed is False
+
+
+def test_history_detail_reports_missing_saved_files_without_invalidating_result(tmp_path):
+    client, db = _make_client()
+    row = _stored_result(tmp_path)
+    Path(row.classes_path).unlink()
+
+    with patch.object(
+        identification_results.crud_results,
+        "get_succeeded_history_by_id",
+        new=AsyncMock(return_value=row),
+        create=True,
+    ), patch.object(
+        identification_results.crud_results,
+        "invalidate_succeeded_result",
+        new=AsyncMock(),
+    ) as invalidate:
+        response = client.get("/api/identification-results/history/result-1")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["render_status"] == "UNAVAILABLE"
+    assert db.committed is False
+    invalidate.assert_not_awaited()
 
 
 def test_resolve_missing_identity_does_not_create_or_schedule_result():

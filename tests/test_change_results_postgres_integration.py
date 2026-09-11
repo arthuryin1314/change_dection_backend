@@ -88,6 +88,7 @@ def _apply_migration() -> None:
             cursor.execute(Path("migrations/003_change_results.sql").read_text(encoding="utf-8"))
             cursor.execute(Path("migrations/004_change_result_analysis.sql").read_text(encoding="utf-8"))
             cursor.execute(Path("migrations/005_change_orchestration.sql").read_text(encoding="utf-8"))
+            cursor.execute(Path("migrations/006_result_history.sql").read_text(encoding="utf-8"))
         connection.commit()
     finally:
         connection.close()
@@ -133,13 +134,13 @@ def _seed_result(
                 inference_parameters, classification_scheme_version,
                 pipeline_version, grid_policy_version, status,
                 started_at, heartbeat_at, lease_expires_at, lease_owner,
-                completed_at, classes_path, valid_mask_path, crs, transform,
+                completed_at, created_at, classes_path, valid_mask_path, crs, transform,
                 raster_width, raster_height, resolution, bounds, area_status
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s::json,
                 %s, %s, %s, 'SUCCEEDED', %s, %s, %s, %s, %s,
-                %s, %s, %s, %s::json, %s, %s, %s::json, %s::json,
+                %s, %s, %s, %s, %s::json, %s, %s, %s::json, %s::json,
                 'NOT_COMPUTED'
             )
             """,
@@ -159,6 +160,7 @@ def _seed_result(
                 now,
                 now,
                 f"integration-{result_id}",
+                now,
                 now,
                 str(stored.classes_path),
                 str(stored.valid_mask_path),
@@ -492,6 +494,9 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
             assert data["analysis"]["grid_policy_version"] == "aligned-grid-v1"
             assert len(data["analysis"]["identity_sha256"]) == 64
             assert data["analysis"]["alignment_mode"] == "DIRECT"
+            assert data["before"]["source"]["image"]["name"].startswith("before-")
+            assert data["after"]["source"]["image"]["name"].startswith("after-")
+            assert data["before"]["source"]["model"]["name"].startswith("change-")
 
             reloaded_client = client
             fetched = reloaded_client.get(f"/api/change-results/{request_id}")
@@ -501,6 +506,16 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
             duplicate = reloaded_client.post("/api/change-results", json=payload)
             assert duplicate.status_code == 202
             assert duplicate.json()["data"] == data
+
+            history = reloaded_client.get("/api/change-results/history")
+            assert history.status_code == 200
+            assert history.json()["data"]["total"] == 1
+            assert history.json()["data"]["items"][0]["result_id"] == data["result_id"]
+            history_detail = reloaded_client.get(
+                f"/api/change-results/history/{data['result_id']}"
+            )
+            assert history_detail.status_code == 200
+            assert history_detail.json()["data"] == data
 
             conflicting = reloaded_client.post(
                 "/api/change-results",
@@ -514,6 +529,10 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
             )
             denied = reloaded_client.get(f"/api/change-results/{request_id}")
             assert denied.status_code == 404
+            denied_history = reloaded_client.get(
+                f"/api/change-results/history/{data['result_id']}"
+            )
+            assert denied_history.status_code == 404
     finally:
         _cleanup(seeded["user_id"])
 

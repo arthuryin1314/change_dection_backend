@@ -260,12 +260,23 @@ async def edit_image(
 @router.get("/{image_id}", response_model=ImageRecordResponse, summary="根据ID获取影像")
 async def get_image(
     image_id: int,
+    expected_sha256: Optional[str] = Query(
+        None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     image = await crud_images.get_image_by_id(db, image_id, current_user.id)
     if not image:
         raise HTTPException(status_code=404, detail="影像不存在")
+    if (
+        expected_sha256 is not None
+        and image.content_sha256 != expected_sha256
+    ):
+        raise HTTPException(status_code=409, detail="历史影像版本已不可用")
     return success_response(message="获取成功", data=_image_data(image))
 
 

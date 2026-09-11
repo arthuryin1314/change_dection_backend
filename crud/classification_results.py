@@ -4,6 +4,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.classification_results import ClassificationResult
+from crud.succeeded_history import get_for_user, list_for_user
 from services.identification_results import FAILED, SUCCEEDED
 from utils.classification_area import validate_class_area_m2
 
@@ -20,6 +21,30 @@ async def get_result_by_id(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def list_succeeded_history(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    offset: int,
+    limit: int,
+) -> tuple[list[ClassificationResult], int]:
+    return await list_for_user(
+        db,
+        ClassificationResult,
+        user_id,
+        offset=offset,
+        limit=limit,
+    )
+
+
+async def get_succeeded_history_by_id(
+    db: AsyncSession,
+    result_id: str,
+    user_id: int,
+) -> ClassificationResult | None:
+    return await get_for_user(db, ClassificationResult, result_id, user_id)
 
 
 async def get_latest_by_sources(

@@ -95,6 +95,15 @@ class ChangeResult(Base):
     )
 
 
+Index(
+    "ix_change_results_user_history",
+    ChangeResult.user_id,
+    ChangeResult.completed_at.desc(),
+    ChangeResult.id.desc(),
+    postgresql_where=ChangeResult.status == "SUCCEEDED",
+)
+
+
 class ChangeRequest(Base):
     __tablename__ = "change_requests"
     __table_args__ = (

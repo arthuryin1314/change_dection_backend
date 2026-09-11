@@ -177,6 +177,62 @@ def test_post_always_returns_202_and_schedules_new_task():
     schedule.assert_called_once_with(41, 7, "owner")
 
 
+def test_post_freezes_source_names_with_submitted_inputs():
+    client, _ = _client()
+    before = SimpleNamespace(
+        id=1,
+        image_name="变化前名称",
+        img_path="before.tif",
+        content_sha256="1" * 64,
+        content_sha256_size=10,
+        content_sha256_mtime_ns=100,
+    )
+    after = SimpleNamespace(
+        id=2,
+        image_name="变化后名称",
+        img_path="after.tif",
+        content_sha256="2" * 64,
+        content_sha256_size=11,
+        content_sha256_mtime_ns=101,
+    )
+    model = SimpleNamespace(
+        id=11,
+        model_name="计算时模型",
+        model_type="semantic_segmentation",
+        framework="PyTorch",
+        weight_file_path="model.pth",
+        weight_content_sha256="3" * 64,
+        weight_content_sha256_size=12,
+        weight_content_sha256_mtime_ns=102,
+    )
+    claim = SimpleNamespace(row=_row(), should_start=False, request_conflict=False)
+
+    with patch.object(
+        change_results.crud_results,
+        "get_request_binding",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
+        change_results.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(side_effect=[before, after]),
+    ), patch.object(
+        change_results.crud_models,
+        "get_ml_model_by_id",
+        new=AsyncMock(return_value=model),
+    ), patch.object(
+        change_results.crud_results,
+        "claim_submission",
+        new=AsyncMock(return_value=claim),
+    ) as save:
+        response = client.post("/api/change-results", json=_payload())
+
+    assert response.status_code == 202
+    submitted = save.await_args.kwargs["submitted_inputs"]
+    assert submitted["before"]["name"] == "变化前名称"
+    assert submitted["after"]["name"] == "变化后名称"
+    assert submitted["model"]["name"] == "计算时模型"
+
+
 def test_post_replay_of_completed_request_still_returns_202():
     client, _ = _client()
     binding = SimpleNamespace(
@@ -394,3 +450,89 @@ def test_get_other_users_request_returns_404():
         response = client.get(f"/api/change-results/{REQUEST_ID}")
 
     assert response.status_code == 404
+
+
+def test_history_lists_complete_and_legacy_results_without_writing():
+    client, db = _client()
+    complete = _succeeded()
+    legacy = _succeeded()
+    legacy.id = 40
+    legacy.calculated_at = None
+
+    with patch.object(
+        change_results.crud_results,
+        "list_succeeded_history",
+        new=AsyncMock(return_value=([complete, legacy], 2)),
+        create=True,
+    ):
+        response = client.get("/api/change-results/history")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "items": [
+            {
+                "result_id": 41,
+                "request_id": REQUEST_ID,
+                "completed_at": "2026-09-10T00:00:00+00:00",
+                "calculated_at": "2026-09-10T00:00:00+00:00",
+                "result_status": "AVAILABLE",
+                "before": complete.before_snapshot,
+                "after": complete.after_snapshot,
+            },
+            {
+                "result_id": 40,
+                "request_id": REQUEST_ID,
+                "completed_at": "2026-09-10T00:00:00+00:00",
+                "calculated_at": None,
+                "result_status": "INCOMPLETE",
+                "before": legacy.before_snapshot,
+                "after": legacy.after_snapshot,
+            },
+        ],
+        "total": 2,
+        "page": 1,
+        "page_size": 20,
+    }
+    assert db.commits == 0
+
+
+def test_history_detail_rejects_incomplete_legacy_result_before_serializing():
+    client, db = _client()
+    legacy = _succeeded()
+    legacy.calculated_at = None
+
+    with patch.object(
+        change_results.crud_results,
+        "get_succeeded_history_by_id",
+        new=AsyncMock(return_value=legacy),
+        create=True,
+    ):
+        response = client.get("/api/change-results/history/41")
+
+    assert response.status_code == 409
+    assert response.json()["data"] == {"result_id": 41, "status": "INCOMPLETE"}
+    assert db.commits == 0
+
+
+def test_history_detail_returns_optional_grid_without_expiring_task():
+    client, db = _client()
+    row = _succeeded()
+
+    with patch.object(
+        change_results.crud_results,
+        "get_succeeded_history_by_id",
+        new=AsyncMock(return_value=row),
+        create=True,
+    ), patch.object(
+        change_results.crud_results,
+        "expire_request",
+        new=AsyncMock(),
+    ) as expire:
+        response = client.get("/api/change-results/history/41")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["result_id"] == 41
+    assert response.json()["data"]["grid"]["crs"] == "EPSG:4528"
+    assert response.json()["data"]["analysis"]["resolution"] is None
+    assert db.commits == 0
+    expire.assert_not_awaited()

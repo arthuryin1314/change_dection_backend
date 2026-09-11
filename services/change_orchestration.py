@@ -52,6 +52,7 @@ from utils.transition_matrix import (
     TransitionMatrixError,
     compute_transition_matrix_m2,
 )
+from utils.result_source import ResultSourceSnapshot, result_source_snapshot
 
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,19 @@ def _orchestration_identity(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _source_snapshot(submitted: dict, period: str) -> ResultSourceSnapshot:
+    return result_source_snapshot(
+        submitted[f"{period}_image_id"],
+        submitted[period].get("name"),
+        submitted["model_id"],
+        submitted["model"].get("name"),
+    )
+
+
+def _resolved_period(row, submitted: dict, period: str) -> ResolvedPeriod:
+    return ResolvedPeriod.from_row(row, _source_snapshot(submitted, period))
+
+
 def _validate_identity_contract(submitted: dict) -> dict:
     identity_contract = submitted["identity_contract"]
     parameters = identity_contract["inference_parameters"]
@@ -252,6 +266,7 @@ async def _ensure_classification(
     user_id: int,
     source_image_id: int,
     source_model_id: int,
+    source_snapshot: ResultSourceSnapshot,
     image: dict,
     weight: dict,
     identity: ResultIdentity,
@@ -275,6 +290,7 @@ async def _ensure_classification(
             db,
             source_image_id=source_image_id,
             source_model_id=source_model_id,
+            source_snapshot=source_snapshot,
         )
         claim = await claim_identification_result(
             store,
@@ -304,6 +320,7 @@ async def _ensure_classification(
             user_id=user_id,
             source_image_id=source_image_id,
             source_model_id=source_model_id,
+            source_snapshot=source_snapshot,
             image=image,
             weight=weight,
             identity=identity,
@@ -492,6 +509,7 @@ async def _execute(result_id: int, user_id: int, owner: str) -> None:
                 user_id=user_id,
                 source_image_id=submitted[f"{period}_image_id"],
                 source_model_id=submitted["model_id"],
+                source_snapshot=_source_snapshot(submitted, period),
                 image=frozen[period],
                 weight=frozen["model"],
                 identity=generated_identities[period],
@@ -522,8 +540,8 @@ async def _execute(result_id: int, user_id: int, owner: str) -> None:
             return
 
     resolved = ResolvedChangeInputs(
-        before=ResolvedPeriod.from_row(period_results["before"]),
-        after=ResolvedPeriod.from_row(period_results["after"]),
+        before=_resolved_period(period_results["before"], submitted, "before"),
+        after=_resolved_period(period_results["after"], submitted, "after"),
     )
     result = await asyncio.to_thread(
         compute_transition_matrix_m2,

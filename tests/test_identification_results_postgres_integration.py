@@ -98,6 +98,9 @@ def _seed_sources(source_path: Path, weight_path: Path):
     try:
         with connection.cursor() as cursor:
             cursor.execute(
+                Path("migrations/006_result_history.sql").read_text(encoding="utf-8")
+            )
+            cursor.execute(
                 """
                 INSERT INTO user_info (username, phone, password)
                 VALUES (%s, %s, %s)
@@ -292,6 +295,22 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
             assert rendered.status_code == 200
             assert rendered.headers["content-type"] == "image/png"
 
+            history = client.get("/api/identification-results/history")
+            assert history.status_code == 200
+            assert history.json()["data"]["total"] == 1
+            assert history.json()["data"]["items"][0]["result_id"] == result_id
+            history_detail = client.get(
+                f"/api/identification-results/history/{result_id}"
+            )
+            assert history_detail.status_code == 200
+            assert history_detail.json()["data"]["class_area_m2"] == area_data[
+                "class_area_m2"
+            ]
+            assert history_detail.json()["data"]["source"]["image"]["name"].startswith(
+                "integration-"
+            )
+            assert history_detail.json()["data"]["render_status"] == "AVAILABLE"
+
             second_weight = tmp_path / "second.pth"
             second_weight.write_bytes(b"different-integration-weight")
             second_weight.with_suffix(".py").write_text("# fixture", encoding="utf-8")
@@ -323,10 +342,17 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
             assert _result_files(failed_id) == ("FAILED", None, None)
             assert not (tmp_path / "results" / failed_id).exists()
 
+            history_after_failure = client.get("/api/identification-results/history")
+            assert history_after_failure.json()["data"]["total"] == 2
+
             app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
                 id=user_id + 1_000_000
             )
             denied = client.get(f"/api/identification-results/{result_id}")
             assert denied.status_code == 404
+            denied_history = client.get(
+                f"/api/identification-results/history/{result_id}"
+            )
+            assert denied_history.status_code == 404
     finally:
         _cleanup_sources(user_id)

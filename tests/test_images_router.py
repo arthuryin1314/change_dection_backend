@@ -131,6 +131,40 @@ def test_get_image_keeps_the_image_record_contract():
     assert response.json()["data"]["image_name"] == "河流影像"
 
 
+def test_get_image_accepts_the_saved_content_version():
+    client = _make_client()
+    image = _image(image_id=9)
+
+    with patch.object(
+        images.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=image),
+    ):
+        response = client.get(
+            "/api/images/9",
+            params={"expected_sha256": image.content_sha256},
+        )
+
+    assert response.status_code == 200
+
+
+def test_get_image_rejects_a_replaced_historical_content_version():
+    client = _make_client()
+
+    with patch.object(
+        images.crud_images,
+        "get_image_by_id",
+        new=AsyncMock(return_value=_image(image_id=9)),
+    ):
+        response = client.get(
+            "/api/images/9",
+            params={"expected_sha256": "f" * 64},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "历史影像版本已不可用"
+
+
 def test_get_image_returns_404_when_the_record_is_missing():
     client = _make_client()
 

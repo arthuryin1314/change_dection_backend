@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,6 +49,10 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _iso(value):
+    return value.isoformat() if value is not None else None
+
+
 def _canonical_sha256(payload: dict) -> str:
     canonical = json.dumps(
         payload,
@@ -71,6 +75,7 @@ def _request_fingerprint(payload: CreateChangeResultRequest) -> str:
 
 def _source_descriptor(row, path_name: str, hash_prefix: str) -> dict:
     return {
+        "name": row.image_name,
         "path": getattr(row, path_name),
         "cached_sha256": getattr(row, f"{hash_prefix}_sha256"),
         "cached_size": getattr(row, f"{hash_prefix}_sha256_size"),
@@ -99,6 +104,7 @@ async def _submitted_inputs(
         "before": _source_descriptor(before, "img_path", "content"),
         "after": _source_descriptor(after, "img_path", "content"),
         "model": {
+            "name": model.model_name,
             "weight_path": model.weight_file_path,
             "cached_sha256": model.weight_content_sha256,
             "cached_size": model.weight_content_sha256_size,
@@ -138,6 +144,7 @@ def _period_status(row, period: str) -> dict:
 
 def _serialize(row, request_id: str) -> dict:
     data = {
+        "result_id": row.id,
         "request_id": request_id,
         "status": row.status,
         "phase": row.phase,
@@ -150,11 +157,9 @@ def _serialize(row, request_id: str) -> dict:
             "before": _period_status(row, "before"),
             "after": _period_status(row, "after"),
         },
-        "started_at": row.started_at.isoformat(),
-        "heartbeat_at": row.heartbeat_at.isoformat(),
-        "completed_at": (
-            row.completed_at.isoformat() if row.completed_at is not None else None
-        ),
+        "started_at": _iso(row.started_at),
+        "heartbeat_at": _iso(row.heartbeat_at),
+        "completed_at": _iso(row.completed_at),
     }
     if row.status == crud_results.SUCCEEDED:
         data.update(
@@ -164,24 +169,33 @@ def _serialize(row, request_id: str) -> dict:
                 "after": row.after_snapshot,
                 "matrix_m2": row.matrix_m2,
                 "common_valid_area_m2": row.common_valid_area_m2,
-                "grid": {
-                    "crs": row.crs,
-                    "transform": row.transform,
-                    "width": row.raster_width,
-                    "height": row.raster_height,
-                    "bounds": row.bounds,
-                },
                 "before_window": row.before_window,
                 "after_window": row.after_window,
                 "analysis": {
                     "calculation_version": row.calculation_version,
                     "grid_policy_version": row.grid_policy_version,
                     "identity_sha256": row.analysis_identity_sha256,
+                    "resolution": (row.analysis_metadata or {}).get("resolution"),
                     **(row.analysis_metadata or {}),
                 },
-                "calculated_at": row.calculated_at.isoformat(),
+                "calculated_at": _iso(row.calculated_at),
             }
         )
+        grid_values = (
+            row.crs,
+            row.transform,
+            row.raster_width,
+            row.raster_height,
+            row.bounds,
+        )
+        if all(value is not None for value in grid_values):
+            data["grid"] = {
+                "crs": row.crs,
+                "transform": row.transform,
+                "width": row.raster_width,
+                "height": row.raster_height,
+                "bounds": row.bounds,
+            }
     elif row.status == crud_results.FAILED:
         data.update(
             {
@@ -191,6 +205,71 @@ def _serialize(row, request_id: str) -> dict:
             }
         )
     return data
+
+
+def _history_result_status(row) -> str:
+    if row.matrix_m2 is None or row.calculated_at is None:
+        return "INCOMPLETE"
+    return "AVAILABLE"
+
+
+def _serialize_history_item(row) -> dict:
+    return {
+        "result_id": row.id,
+        "request_id": row.request_id,
+        "completed_at": _iso(row.completed_at),
+        "calculated_at": _iso(row.calculated_at),
+        "result_status": _history_result_status(row),
+        "before": row.before_snapshot,
+        "after": row.after_snapshot,
+    }
+
+
+@router.get("/history")
+async def list_change_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    rows, total = await crud_results.list_succeeded_history(
+        db,
+        current_user.id,
+        offset=(page - 1) * page_size,
+        limit=page_size,
+    )
+    return api_response(
+        200,
+        "查询成功",
+        {
+            "items": [_serialize_history_item(row) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+
+
+@router.get("/history/{result_id}")
+async def get_change_history(
+    result_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    row = await crud_results.get_succeeded_history_by_id(
+        db,
+        result_id,
+        current_user.id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="历史记录不存在或无权访问")
+    if _history_result_status(row) == "INCOMPLETE":
+        return api_response(
+            409,
+            "变化历史结果数据不完整",
+            {"result_id": result_id, "status": "INCOMPLETE"},
+        )
+    return api_response(200, "查询成功", _serialize(row, row.request_id))
 
 
 def _failure(row, request_id: str):

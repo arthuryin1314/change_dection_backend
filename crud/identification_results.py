@@ -12,6 +12,7 @@ from services.identification_results import (
     Lease,
     ResultIdentity,
 )
+from utils.result_source import ResultSourceSnapshot
 
 
 def _record(row: ClassificationResult) -> IdentificationResultRecord:
@@ -34,10 +35,12 @@ class SqlAlchemyClaimStore:
         *,
         source_image_id: int,
         source_model_id: int,
+        source_snapshot: ResultSourceSnapshot,
     ):
         self.session = session
         self.source_image_id = source_image_id
         self.source_model_id = source_model_id
+        self.source_snapshot = source_snapshot
 
     async def insert_processing(
         self,
@@ -51,6 +54,7 @@ class SqlAlchemyClaimStore:
                 user_id=identity.user_id,
                 source_image_id=self.source_image_id,
                 source_model_id=self.source_model_id,
+                source_snapshot=self.source_snapshot,
                 identity_sha256=identity.sha256(),
                 image_content_sha256=identity.image_content_sha256.lower(),
                 weight_content_sha256=identity.weight_content_sha256.lower(),
@@ -121,6 +125,7 @@ class SqlAlchemyClaimStore:
                 area_status="NOT_COMPUTED",
                 area_completed_at=None,
                 area_failure_detail=None,
+                source_snapshot=self.source_snapshot,
             )
             .returning(ClassificationResult)
         )

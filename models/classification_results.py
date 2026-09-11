@@ -52,6 +52,7 @@ class ClassificationResult(Base):
         ForeignKey("model_library.id", ondelete="SET NULL"),
         nullable=True,
     )
+    source_snapshot = Column(JSON, nullable=True)
     identity_sha256 = Column(String(64), nullable=False)
     image_content_sha256 = Column(String(64), nullable=False)
     weight_content_sha256 = Column(String(64), nullable=False)
@@ -89,3 +90,12 @@ class ClassificationResult(Base):
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+
+
+Index(
+    "ix_classification_results_user_history",
+    ClassificationResult.user_id,
+    ClassificationResult.completed_at.desc(),
+    ClassificationResult.id.desc(),
+    postgresql_where=ClassificationResult.status == "SUCCEEDED",
+)
