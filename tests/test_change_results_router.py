@@ -1,5 +1,6 @@
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -182,6 +183,9 @@ def test_post_freezes_source_names_with_submitted_inputs():
     before = SimpleNamespace(
         id=1,
         image_name="变化前名称",
+        capture_date=None,
+        satellite=None,
+        resolution=None,
         img_path="before.tif",
         content_sha256="1" * 64,
         content_sha256_size=10,
@@ -190,6 +194,9 @@ def test_post_freezes_source_names_with_submitted_inputs():
     after = SimpleNamespace(
         id=2,
         image_name="变化后名称",
+        capture_date=None,
+        satellite=None,
+        resolution=None,
         img_path="after.tif",
         content_sha256="2" * 64,
         content_sha256_size=11,
@@ -231,6 +238,123 @@ def test_post_freezes_source_names_with_submitted_inputs():
     assert submitted["before"]["name"] == "变化前名称"
     assert submitted["after"]["name"] == "变化后名称"
     assert submitted["model"]["name"] == "计算时模型"
+    assert submitted["snapshot_metadata"] == {
+        "before": {
+            "name": "变化前名称",
+            "capture_date": None,
+            "satellite": None,
+            "resolution": None,
+        },
+        "after": {
+            "name": "变化后名称",
+            "capture_date": None,
+            "satellite": None,
+            "resolution": None,
+        },
+        "model": {"name": "计算时模型"},
+    }
+
+
+def test_submitted_inputs_normalize_decimal_and_date_for_json():
+    database = FakeDatabase()
+    before = SimpleNamespace(
+        id=1,
+        image_name="前期影像",
+        capture_date=date(2024, 5, 1),
+        satellite="Sentinel-2",
+        resolution=Decimal("10.0000"),
+        img_path="before.tif",
+        content_sha256="1" * 64,
+        content_sha256_size=10,
+        content_sha256_mtime_ns=100,
+    )
+    after = SimpleNamespace(
+        id=2,
+        image_name="后期影像",
+        capture_date=None,
+        satellite=None,
+        resolution=Decimal("0.8000"),
+        img_path="after.tif",
+        content_sha256="2" * 64,
+        content_sha256_size=11,
+        content_sha256_mtime_ns=101,
+    )
+    model = SimpleNamespace(
+        id=11,
+        model_name="模型",
+        model_type="semantic_segmentation",
+        framework="PyTorch",
+        weight_file_path="model.pth",
+        weight_content_sha256="3" * 64,
+        weight_content_sha256_size=12,
+        weight_content_sha256_mtime_ns=102,
+    )
+    payload = change_results.CreateChangeResultRequest(**_payload())
+
+    async def run():
+        with patch.object(
+            change_results.crud_images,
+            "get_image_by_id",
+            new=AsyncMock(side_effect=[before, after]),
+        ), patch.object(
+            change_results.crud_models,
+            "get_ml_model_by_id",
+            new=AsyncMock(return_value=model),
+        ):
+            return await change_results._submitted_inputs(database, 7, payload)
+
+    import asyncio
+
+    submitted = asyncio.run(run())
+
+    assert submitted["snapshot_metadata"] == {
+        "before": {
+            "name": "前期影像",
+            "capture_date": "2024-05-01",
+            "satellite": "Sentinel-2",
+            "resolution": "10.0000",
+        },
+        "after": {
+            "name": "后期影像",
+            "capture_date": None,
+            "satellite": None,
+            "resolution": "0.8000",
+        },
+        "model": {"name": "模型"},
+    }
+
+
+def test_retry_legacy_submitted_inputs_without_snapshot_metadata_keeps_payload_usable():
+    client, _ = _client()
+    submitted = _submitted()
+    submitted.pop("snapshot_metadata", None)
+    failed = _row(status="FAILED", phase="FAILED", submitted_inputs=submitted)
+    captured = {}
+
+    async def claim(*args, **kwargs):
+        captured["submitted"] = kwargs["submitted"]
+        return change_results.api_response(202, "变化分析任务已接收", {"status": "PROCESSING"})
+
+    with patch.object(
+        change_results.crud_results,
+        "expire_request",
+        new=AsyncMock(return_value=0),
+    ), patch.object(
+        change_results.crud_results,
+        "get_by_request",
+        new=AsyncMock(return_value=failed),
+    ), patch.object(
+        change_results,
+        "_claim",
+        new=claim,
+    ):
+        response = client.post(
+            f"/api/change-results/{REQUEST_ID}/retry",
+            json={"request_id": RETRY_ID},
+        )
+
+    assert response.status_code == 202
+    assert "snapshot_metadata" not in captured["submitted"]
 
 
 def test_post_replay_of_completed_request_still_returns_202():
@@ -536,3 +660,18 @@ def test_history_detail_returns_optional_grid_without_expiring_task():
     assert response.json()["data"]["analysis"]["resolution"] is None
     assert db.commits == 0
     expire.assert_not_awaited()
+
+
+def test_preparation_key_ignores_snapshot_metadata_and_keeps_json_scalars_stable():
+    base = _submitted()
+    with_metadata = dict(base)
+    with_metadata["snapshot_metadata"] = {
+        "before": {
+            "name": "影像",
+            "capture_date": date(2024, 5, 1).isoformat(),
+            "satellite": "Sentinel-2",
+            "resolution": format(Decimal("10.0000"), "f"),
+        }
+    }
+
+    assert change_results._preparation_key(7, base) == change_results._preparation_key(7, with_metadata)

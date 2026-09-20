@@ -186,8 +186,31 @@ def _source_snapshot(submitted: dict, period: str) -> ResultSourceSnapshot:
     )
 
 
+def _change_source_snapshot(row, submitted: dict, period: str) -> dict:
+    metadata = submitted.get("snapshot_metadata") or {}
+    image_meta = metadata.get(period) or {}
+    model_meta = metadata.get("model") or {}
+    return {
+        "image": {
+            "id": submitted[f"{period}_image_id"],
+            "name": image_meta.get("name"),
+            "capture_date": image_meta.get("capture_date"),
+            "satellite": image_meta.get("satellite"),
+            "resolution": image_meta.get("resolution"),
+            "raster_resolution": row.resolution,
+            "crs": row.crs,
+            "width": row.raster_width,
+            "height": row.raster_height,
+        },
+        "model": {
+            "id": submitted["model_id"],
+            "name": model_meta.get("name"),
+        },
+    }
+
+
 def _resolved_period(row, submitted: dict, period: str) -> ResolvedPeriod:
-    return ResolvedPeriod.from_row(row, _source_snapshot(submitted, period))
+    return ResolvedPeriod.from_row(row, _change_source_snapshot(row, submitted, period))
 
 
 def _validate_identity_contract(submitted: dict) -> dict:

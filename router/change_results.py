@@ -1,6 +1,7 @@
 import hashlib
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -83,6 +84,21 @@ def _source_descriptor(row, path_name: str, hash_prefix: str) -> dict:
     }
 
 
+def _snapshot_resolution(value) -> str | None:
+    if value is None:
+        return None
+    return format(Decimal(str(value)).quantize(Decimal("0.0001")), "f")
+
+
+def _snapshot_metadata(row) -> dict:
+    return {
+        "name": row.image_name,
+        "capture_date": row.capture_date.isoformat() if row.capture_date is not None else None,
+        "satellite": row.satellite,
+        "resolution": _snapshot_resolution(row.resolution),
+    }
+
+
 async def _submitted_inputs(
     db: AsyncSession,
     user_id: int,
@@ -101,6 +117,11 @@ async def _submitted_inputs(
         "before_image_id": before.id,
         "after_image_id": after.id,
         "model_id": model.id,
+        "snapshot_metadata": {
+            "before": _snapshot_metadata(before),
+            "after": _snapshot_metadata(after),
+            "model": {"name": model.model_name},
+        },
         "before": _source_descriptor(before, "img_path", "content"),
         "after": _source_descriptor(after, "img_path", "content"),
         "model": {
@@ -124,7 +145,32 @@ async def _submitted_inputs(
 
 
 def _preparation_key(user_id: int, submitted: dict) -> str:
-    return _canonical_sha256({"user_id": user_id, "inputs": submitted})
+    inputs = {
+        key: value
+        for key, value in submitted.items()
+        if key != "snapshot_metadata"
+    }
+    return _canonical_sha256({"user_id": user_id, "inputs": inputs})
+
+
+def _normalize_snapshot(snapshot):
+    if not isinstance(snapshot, dict):
+        return snapshot
+    source = snapshot.get("source")
+    if not isinstance(source, dict):
+        return snapshot
+    image = source.get("image")
+    if not isinstance(image, dict):
+        return snapshot
+    normalized = dict(snapshot)
+    normalized_source = dict(source)
+    normalized_image = dict(image)
+    fields = ("capture_date", "satellite", "resolution", "raster_resolution", "crs", "width", "height")
+    for field in fields:
+        normalized_image.setdefault(field, None)
+    normalized_source["image"] = normalized_image
+    normalized["source"] = normalized_source
+    return normalized
 
 
 def _period_status(row, period: str) -> dict:
@@ -165,8 +211,8 @@ def _serialize(row, request_id: str) -> dict:
         data.update(
             {
                 "classes": ordered_class_definitions(),
-                "before": row.before_snapshot,
-                "after": row.after_snapshot,
+                "before": _normalize_snapshot(row.before_snapshot),
+                "after": _normalize_snapshot(row.after_snapshot),
                 "matrix_m2": row.matrix_m2,
                 "common_valid_area_m2": row.common_valid_area_m2,
                 "before_window": row.before_window,
@@ -220,8 +266,8 @@ def _serialize_history_item(row) -> dict:
         "completed_at": _iso(row.completed_at),
         "calculated_at": _iso(row.calculated_at),
         "result_status": _history_result_status(row),
-        "before": row.before_snapshot,
-        "after": row.after_snapshot,
+        "before": _normalize_snapshot(row.before_snapshot),
+        "after": _normalize_snapshot(row.after_snapshot),
     }
 
 
