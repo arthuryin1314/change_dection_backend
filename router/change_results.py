@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,7 @@ from crud import change_results as crud_results
 from crud import images as crud_images
 from crud import ml_models as crud_models
 from services.change_orchestration import schedule_change_orchestration
+from services.change_report import ReportError, build_change_report
 from utils.change_result_errors import (
     CHANGE_RESULT_NOT_RETRYABLE,
     REQUEST_ID_CONFLICT,
@@ -294,6 +295,21 @@ async def list_change_history(
             "page_size": page_size,
         },
     )
+
+
+@router.get("/history/{result_id}/report.pdf")
+async def get_change_history_report(
+    result_id: int,
+    unit: str = Query("ha"),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    try:
+        content = await build_change_report(db, result_id, current_user.id, unit)
+    except ReportError as exc:
+        detail = {"message": exc.message, "missing_items": exc.missing_items}
+        raise HTTPException(status_code=exc.status, detail=detail) from exc
+    return Response(content=content, media_type="application/pdf", headers={"Cache-Control": "no-store"})
 
 
 @router.get("/history/{result_id}")
