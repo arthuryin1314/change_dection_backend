@@ -307,8 +307,7 @@ async def get_change_history_report(
     try:
         content = await build_change_report(db, result_id, current_user.id, unit)
     except ReportError as exc:
-        detail = {"message": exc.message, "missing_items": exc.missing_items}
-        raise HTTPException(status_code=exc.status, detail=detail) from exc
+        return api_response(exc.status, exc.message, {"missing_items": exc.missing_items})
     return Response(content=content, media_type="application/pdf", headers={"Cache-Control": "no-store"})
 
 

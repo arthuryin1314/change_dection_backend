@@ -227,3 +227,71 @@ def test_history_name_backfill_recovers_legacy_classification_and_change_names()
             )
         connection.commit()
         connection.close()
+
+
+def test_change_snapshot_area_backfill_is_idempotent_and_preserves_existing_values():
+    schema_name = f"history_area_backfill_{uuid4().hex}"
+    connection = psycopg2.connect(_database_url())
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+            )
+            cursor.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            cursor.execute(
+                """
+                CREATE TABLE classification_results (
+                    id VARCHAR(32) PRIMARY KEY,
+                    class_area_m2 JSON,
+                    area_status VARCHAR(16) NOT NULL,
+                    status VARCHAR(16) NOT NULL
+                );
+                CREATE TABLE change_results (
+                    id BIGINT PRIMARY KEY,
+                    before_snapshot JSON,
+                    after_snapshot JSON,
+                    status VARCHAR(16) NOT NULL
+                );
+                INSERT INTO classification_results (id, class_area_m2, area_status, status)
+                VALUES
+                    ('before-result', '[1, 2, 3, 4, 5, 6]', 'SUCCEEDED', 'SUCCEEDED'),
+                    ('after-result', '[6, 5, 4, 3, 2, 1]', 'SUCCEEDED', 'SUCCEEDED');
+                INSERT INTO change_results (id, before_snapshot, after_snapshot, status)
+                VALUES
+                    (41, '{"result_id":"before-result"}', '{"result_id":"after-result"}', 'SUCCEEDED'),
+                    (42, '{"result_id":"before-result", "class_area_m2":[99,99,99,99,99,99]}', '{"result_id":"after-result"}', 'SUCCEEDED');
+                """
+            )
+            migration = Path(
+                "migrations/008_backfill_change_snapshot_areas.sql"
+            ).read_text(encoding="utf-8")
+            cursor.execute(migration)
+            cursor.execute(migration)
+            cursor.execute(
+                """
+                SELECT id,
+                       before_snapshot->'class_area_m2',
+                       after_snapshot->'class_area_m2',
+                       before_snapshot->>'area_status',
+                       after_snapshot->>'area_status'
+                FROM change_results
+                ORDER BY id
+                """
+            )
+            assert cursor.fetchall() == [
+                (41, [1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], "SUCCEEDED", "SUCCEEDED"),
+                (42, [99, 99, 99, 99, 99, 99], [6, 5, 4, 3, 2, 1], None, "SUCCEEDED"),
+            ]
+    finally:
+        connection.rollback()
+        with connection.cursor() as cursor:
+            cursor.execute("SET search_path TO public")
+            cursor.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+        connection.commit()
+        connection.close()
