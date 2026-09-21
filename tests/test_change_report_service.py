@@ -116,3 +116,37 @@ def test_crs_label_uses_readable_wkt_name():
 
     assert format_crs_label(value) == "CGCS2000 / 3-degree Gauss-Kruger zone 40"
     assert format_crs_label("EPSG:4528") == "EPSG:4528"
+
+
+def test_report_falls_back_to_classification_area_when_snapshot_area_is_missing(report_case, monkeypatch):
+    client, row, records, _ = report_case
+    row.before_snapshot['class_area_m2'] = None
+    records['before'].class_area_m2 = [0, 6400, 0, 0, 0, 0]
+    captured = {}
+
+    monkeypatch.setattr(change_report, 'build_pdf', lambda report: captured.update(report) or b'%PDF-1.4')
+    response = client.get('/api/change-results/history/150/report.pdf')
+
+    assert response.status_code == 200
+    assert captured['before_area'] == [0, 6400, 0, 0, 0, 0]
+
+
+def test_report_allows_legacy_snapshot_without_image_hash(report_case, monkeypatch):
+    client, row, _, _ = report_case
+    row.before_snapshot.pop('image_content_sha256')
+    monkeypatch.setattr(change_report, 'build_pdf', lambda report: b'%PDF-1.4')
+
+    response = client.get('/api/change-results/history/150/report.pdf')
+
+    assert response.status_code == 200
+
+
+def test_report_rejects_mismatched_image_hash(report_case, monkeypatch):
+    client, row, _, _ = report_case
+    row.before_snapshot['image_content_sha256'] = 'different'
+    monkeypatch.setattr(change_report, 'build_pdf', lambda report: b'%PDF-1.4')
+
+    response = client.get('/api/change-results/history/150/report.pdf')
+
+    assert response.status_code == 409
+    assert 'before' in response.text and 'image' in response.text
