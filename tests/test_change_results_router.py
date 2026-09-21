@@ -2,13 +2,14 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 os.environ.setdefault(
     "DATABASE_URL",
     "postgresql+asyncpg://user:pass@localhost/test",
 )
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -675,3 +676,46 @@ def test_preparation_key_ignores_snapshot_metadata_and_keeps_json_scalars_stable
     }
 
     assert change_results._preparation_key(7, base) == change_results._preparation_key(7, with_metadata)
+
+@pytest.mark.parametrize('unit', ['m2', 'ha', 'km2'])
+def test_report_route_passes_unit_and_returns_pdf(unit):
+    client, _ = _client()
+    with patch.object(
+        change_results,
+        'build_change_report',
+        new=AsyncMock(return_value=b'%PDF-1.4'),
+    ) as build_report:
+        response = client.get(f'/api/change-results/history/41/report.pdf?unit={unit}')
+
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('application/pdf')
+    assert response.headers['cache-control'] == 'no-store'
+    build_report.assert_awaited_once_with(ANY, 41, 7, unit)
+
+
+def test_report_route_defaults_to_hectares():
+    client, _ = _client()
+    with patch.object(
+        change_results,
+        'build_change_report',
+        new=AsyncMock(return_value=b'%PDF-1.4'),
+    ) as build_report:
+        response = client.get('/api/change-results/history/41/report.pdf')
+
+    assert response.status_code == 200
+    assert build_report.await_args.args[-1] == 'ha'
+
+
+def test_report_route_maps_invalid_unit_to_structured_error():
+    client, _ = _client()
+    with patch.object(
+        change_results,
+        'build_change_report',
+        new=AsyncMock(side_effect=change_results.ReportError(422, '面积单位无效')),
+    ):
+        response = client.get('/api/change-results/history/41/report.pdf?unit=acre')
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload['message'] == '面积单位无效'
+    assert payload['data']['missing_items'] == []

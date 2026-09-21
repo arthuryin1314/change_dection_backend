@@ -69,7 +69,10 @@ def format_area_m2(value, unit):
     quantum = Decimal(1).scaleb(-DECIMALS[unit])
     if converted < quantum:
         return f"<{quantum:f}"
-    return f"{converted.quantize(quantum, rounding=ROUND_HALF_UP):f}"
+    formatted = f"{converted.quantize(quantum, rounding=ROUND_HALF_UP):f}"
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return formatted
 
 def register_font():
     if FONT not in pdfmetrics.getRegisteredFontNames():
@@ -83,6 +86,15 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 from PIL import Image as PILImage
+
+PAGE_MARGIN_HORIZONTAL = 18 * mm
+PAGE_MARGIN_VERTICAL = 16 * mm
+
+def _matrix_col_widths(n_classes):
+    available_width = A4[0] - 2 * PAGE_MARGIN_HORIZONTAL
+    label_width = 25 * mm
+    value_width = (available_width - label_width) / n_classes
+    return [label_width] + [value_width] * n_classes
 
 def _table(rows, widths):
     table = Table(rows, colWidths=widths, repeatRows=1)
@@ -136,12 +148,12 @@ def build_pdf(report):
     rows = [[p("前期／后期")] + [p(item["name"]) for item in report["classes"]]]
     for i,item in enumerate(report["classes"]):
         rows.append([p(item["name"])] + [p(format_area_m2(value,report["unit"])) for value in report["matrix_m2"][i]])
-    story.append(_table(rows,[25*mm]+[25*mm]*len(report["classes"])))
+    story.append(_table(rows, _matrix_col_widths(len(report["classes"]))))
     output = io.BytesIO()
     def set_metadata(canvas, _document):
         canvas.setTitle(report["title"])
         canvas.setAuthor("变化检测系统")
         canvas.setSubject("变化检测结果报告")
 
-    SimpleDocTemplate(output,pagesize=A4,rightMargin=18*mm,leftMargin=18*mm,topMargin=16*mm,bottomMargin=16*mm).build(story, onFirstPage=set_metadata)
+    SimpleDocTemplate(output,pagesize=A4,rightMargin=PAGE_MARGIN_HORIZONTAL,leftMargin=PAGE_MARGIN_HORIZONTAL,topMargin=PAGE_MARGIN_VERTICAL,bottomMargin=PAGE_MARGIN_VERTICAL).build(story, onFirstPage=set_metadata)
     return output.getvalue()
