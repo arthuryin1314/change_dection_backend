@@ -89,6 +89,7 @@ class ChangeResult(Base):
     nodata_value = Column(Integer)
     classification_scheme_version = Column(String(64))
     transition_snapshot = Column(JSON)
+    artifact_metadata = Column(JSON)
     crs = Column(Text)
     transform = Column(JSON)
     raster_width = Column(Integer)

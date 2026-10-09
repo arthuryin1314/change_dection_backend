@@ -9,6 +9,7 @@ ALTER TABLE change_results
     ADD COLUMN IF NOT EXISTS nodata_area_m2 DOUBLE PRECISION,
     ADD COLUMN IF NOT EXISTS nodata_value INTEGER,
     ADD COLUMN IF NOT EXISTS classification_scheme_version VARCHAR(64),
-    ADD COLUMN IF NOT EXISTS transition_snapshot JSON;
+    ADD COLUMN IF NOT EXISTS transition_snapshot JSON,
+    ADD COLUMN IF NOT EXISTS artifact_metadata JSON;
 
 COMMIT;

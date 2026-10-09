@@ -41,6 +41,7 @@ from utils.classification_contract import (
     PIPELINE_VERSION,
 )
 from utils.classification_result_lock import classification_result_lock
+from utils.change_artifacts import remove_change_artifacts, write_change_artifacts
 from utils.classification_storage import (
     RasterGrid,
     StoredClassification,
@@ -67,6 +68,9 @@ DB_POLL_LIMIT = 5
 PERIODS = ("before", "after")
 SNAPSHOT_ROOT = Path(
     os.environ.get("CHANGE_INPUT_SNAPSHOT_DIR", "uploads/change_input_snapshots")
+)
+ARTIFACT_ROOT = Path(
+    os.environ.get("CHANGE_RESULT_ARTIFACT_DIR", "uploads/change_result_artifacts")
 )
 _tasks: dict[int, asyncio.Task] = {}
 _stale_scan_task: asyncio.Task | None = None
@@ -428,6 +432,21 @@ async def _heartbeat(result_id: int, user_id: int, owner: str) -> None:
             await db.commit()
 
 
+async def _cleanup_unpublished_artifacts(result_id: int) -> None:
+    """Remove files unless the result row was durably marked succeeded."""
+    try:
+        async with AsyncSessionLocal() as db:
+            row = await change_crud.get_by_id(db, result_id)
+        if row is None or row.status != SUCCEEDED:
+            await asyncio.to_thread(remove_change_artifacts, ARTIFACT_ROOT, result_id)
+    except Exception:
+        logger.warning(
+            "未发布变化结果 artifact 清理失败: result_id=%s",
+            result_id,
+            exc_info=True,
+        )
+
+
 async def _mark_failure(
     result_id: int,
     user_id: int,
@@ -574,18 +593,41 @@ async def _execute(result_id: int, user_id: int, owner: str) -> None:
         resolved.after.valid_mask_path,
     )
     async with AsyncSessionLocal() as db:
+        if not await change_crud.set_phase(
+            db,
+            result_id=result_id,
+            user_id=user_id,
+            owner=owner,
+            phase="GENERATING_ARTIFACTS",
+            now=_now(),
+        ):
+            return
+    artifact_metadata = await asyncio.to_thread(
+        write_change_artifacts,
+        before_classes_path=resolved.before.classes_path,
+        before_valid_mask_path=resolved.before.valid_mask_path,
+        after_classes_path=resolved.after.classes_path,
+        after_valid_mask_path=resolved.after.valid_mask_path,
+        result=result,
+        storage_root=ARTIFACT_ROOT,
+        result_id=result_id,
+    )
+    async with AsyncSessionLocal() as db:
         row = await change_crud.get_by_id(db, result_id)
         if row is None:
             return
-        await change_crud.mark_succeeded(
+        published = await change_crud.mark_succeeded(
             db,
             request_id=row.request_id,
             user_id=user_id,
             owner=owner,
             resolved=resolved,
             result=result,
+            artifact_metadata=artifact_metadata,
             now=_now(),
         )
+        if published is None:
+            await asyncio.to_thread(remove_change_artifacts, ARTIFACT_ROOT, result_id)
 
 
 async def run_change_orchestration(result_id: int, user_id: int, owner: str) -> None:
@@ -667,6 +709,7 @@ async def run_change_orchestration(result_id: int, user_id: int, owner: str) -> 
         with suppress(asyncio.CancelledError):
             await heartbeat
         await asyncio.to_thread(_cleanup, result_id)
+        await _cleanup_unpublished_artifacts(result_id)
 
 
 def _task_done(result_id: int, task: asyncio.Task) -> None:
