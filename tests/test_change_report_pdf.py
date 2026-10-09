@@ -9,6 +9,7 @@ from utils.change_report_pdf import (
     FONT,
     PAGE_MARGIN_HORIZONTAL,
     _matrix_col_widths,
+    build_pdf,
     format_area_m2,
     register_font,
     safe_text,
@@ -59,3 +60,30 @@ def test_cid_font_smoke_generates_pdf():
     canvas.drawString(72, 760, safe_text('影像🛰️.tif 生僻字𠮷 繁體'))
     canvas.save()
     assert output.getvalue().startswith(b'%PDF')
+
+
+def test_pdf_contains_persisted_transition_page_and_legacy_note():
+    image = BytesIO()
+    from PIL import Image as PILImage
+    PILImage.new("RGB", (1, 1), "white").save(image, format="PNG")
+    image_data = image.getvalue()
+    report = {
+        "title": "变化检测结果报告",
+        "detection_time": "2026-09-20 08:00:00",
+        "generated_at": "2026-09-20 08:01:00",
+        "unit": "ha",
+        "model": "model",
+        "classes": [{"id": i, "name": name} for i, name in enumerate(("其他／背景", "水系", "林地", "道路", "种植土地", "房屋建筑"))],
+        "before": {**{key: "未记录" for key in ("name", "capture_date", "satellite", "resolution", "crs", "size")}, "original_png": image_data, "classification_png": image_data},
+        "after": {**{key: "未记录" for key in ("name", "capture_date", "satellite", "resolution", "crs", "size")}, "original_png": image_data, "classification_png": image_data},
+        "before_area": [0] * 6,
+        "after_area": [0] * 6,
+        "common_valid_area_m2": 0,
+        "matrix_m2": [[0] * 6 for _ in range(6)],
+        "legacy_transition_note": "未保存多值转移结果；以下仅显示历史矩阵。",
+        "transition_png": None,
+        "transition_legend": None,
+        "transition_snapshot": None,
+    }
+    output = build_pdf(report)
+    assert output.startswith(b"%PDF")

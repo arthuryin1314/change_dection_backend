@@ -1,6 +1,11 @@
 import asyncio
+import io
+import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
+
+from PIL import Image
 
 from crud import change_results as change_crud
 from crud import classification_results as classification_crud
@@ -8,6 +13,7 @@ from crud import images as image_crud
 from utils.change_report_images import read_period_images
 from utils.change_report_pdf import build_pdf, format_crs_label, format_report_datetime
 from utils.classification_area import validate_class_area_m2
+from utils.change_artifacts import MAX_VISUAL_EDGE
 
 
 class ReportError(Exception):
@@ -42,6 +48,51 @@ def _validate_image_identity(snapshot, classification, period):
     if snapshot_hash is not None and classification_hash is not None and snapshot_hash != classification_hash:
         return {"period": period, "resource": "image"}
     return None
+
+
+def _artifact_path(row, artifact_name):
+    metadata = getattr(row, "artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    item = metadata.get(artifact_name)
+    if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+        return None
+    root = Path(os.environ.get("CHANGE_RESULT_ARTIFACT_DIR", "uploads/change_result_artifacts")).resolve()
+    result_directory = (root / str(row.id)).resolve()
+    path = (result_directory / item["filename"]).resolve()
+    if path.parent != result_directory or not path.is_file():
+        return None
+    return path
+
+
+def _read_artifact_image(path):
+    with Image.open(path) as source:
+        image = source.copy()
+        image.thumbnail((MAX_VISUAL_EDGE, MAX_VISUAL_EDGE), Image.Resampling.NEAREST)
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _load_transition_artifact(row):
+    metadata = getattr(row, "artifact_metadata", None)
+    if metadata is None or metadata == {}:
+        return None
+    if not isinstance(metadata, dict):
+        raise ReportError(409, "报告所需资源缺失", [{"resource": "transition_artifact"}])
+    image_path = _artifact_path(row, "visualization_png")
+    legend_path = _artifact_path(row, "legend")
+    snapshot = getattr(row, "transition_snapshot", None)
+    if image_path is None or legend_path is None or not isinstance(snapshot, dict):
+        raise ReportError(409, "报告所需资源缺失", [{"resource": "transition_artifact"}])
+    try:
+        legend = json.loads(legend_path.read_text(encoding="utf-8"))
+        if not isinstance(legend, dict):
+            raise ValueError("legend 必须是对象")
+        image = _read_artifact_image(image_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        raise ReportError(409, "报告所需资源缺失", [{"resource": "transition_artifact"}])
+    return image, legend, snapshot
 
 
 async def _resolve_report_period(db, name, row, user_id):
@@ -89,6 +140,7 @@ async def build_change_report(db, result_id, user_id, unit):
         raise ReportError(409, "报告所需资源缺失", missing)
 
     def render():
+        transition_artifact = _load_transition_artifact(row)
         report = {
             "title": "变化检测结果报告",
             "result_id": row.id,
@@ -99,7 +151,17 @@ async def build_change_report(db, result_id, user_id, unit):
             "matrix_m2": row.matrix_m2,
             "common_valid_area_m2": row.common_valid_area_m2,
             "classes": [{"id": i, "name": name} for i, name in enumerate(("其他／背景", "水系", "林地", "道路", "种植土地", "房屋建筑"))],
+            "transition_png": None,
+            "transition_legend": None,
+            "transition_snapshot": None,
+            "legacy_transition_note": "未保存多值转移结果；以下仅显示历史矩阵。",
         }
+        if transition_artifact is not None:
+            report["transition_png"], report["transition_legend"], report["transition_snapshot"] = transition_artifact
+            classes = report["transition_legend"].get("classes")
+            if isinstance(classes, list) and len(classes) == len(report["classes"]):
+                report["classes"] = classes
+            report["legacy_transition_note"] = None
         for name, (snapshot, classification, image, _) in periods.items():
             classification.image_path = image.img_path
             original, classified = read_period_images(classification)
