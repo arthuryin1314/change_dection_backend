@@ -420,7 +420,17 @@ def _owned_processing_request_by_id(result_id: int, user_id: int, owner: str):
     )
 
 
-async def mark_succeeded(db, *, request_id, user_id, owner, resolved, result, now):
+async def mark_succeeded(
+    db,
+    *,
+    request_id,
+    user_id,
+    owner,
+    resolved,
+    result,
+    artifact_metadata,
+    now,
+):
     transition_snapshot = {
         "classification_scheme_version": result.classification_scheme_version,
         "nodata_value": result.nodata_value,
@@ -474,6 +484,7 @@ async def mark_succeeded(db, *, request_id, user_id, owner, resolved, result, no
         "nodata_value": result.nodata_value,
         "classification_scheme_version": result.classification_scheme_version,
         "transition_snapshot": transition_snapshot,
+        "artifact_metadata": artifact_metadata,
         "crs": str(result.grid.crs),
         "transform": list(result.grid.transform)[:6],
         "raster_width": result.grid.width,

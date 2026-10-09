@@ -89,6 +89,7 @@ def _apply_migration() -> None:
             cursor.execute(Path("migrations/004_change_result_analysis.sql").read_text(encoding="utf-8"))
             cursor.execute(Path("migrations/005_change_orchestration.sql").read_text(encoding="utf-8"))
             cursor.execute(Path("migrations/006_result_history.sql").read_text(encoding="utf-8"))
+            cursor.execute(Path("migrations/009_directed_transition_results.sql").read_text(encoding="utf-8"))
         connection.commit()
     finally:
         connection.close()

@@ -1,10 +1,13 @@
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -231,6 +234,7 @@ def _serialize(row, request_id: str) -> dict:
     }
     if row.status == crud_results.SUCCEEDED:
         transition = _serialize_transition(row)
+        artifacts = _serialize_artifacts(row)
         data.update(
             {
                 "classes": ordered_class_definitions(),
@@ -239,6 +243,7 @@ def _serialize(row, request_id: str) -> dict:
                 "matrix_m2": row.matrix_m2,
                 "common_valid_area_m2": row.common_valid_area_m2,
                 "transition": transition,
+                "artifacts": artifacts,
                 "before_window": row.before_window,
                 "after_window": row.after_window,
                 "analysis": {
@@ -275,6 +280,49 @@ def _serialize(row, request_id: str) -> dict:
             }
         )
     return data
+
+
+def _serialize_artifacts(row) -> dict | None:
+    metadata = getattr(row, "artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    result = {}
+    for name, value in metadata.items():
+        if name == "artifact_version" or not isinstance(value, dict):
+            continue
+        item = dict(value)
+        filename = item.get("filename")
+        if isinstance(filename, str):
+            item["url"] = f"/api/change-results/{row.request_id}/artifacts/{filename}"
+        result[name] = item
+    return {"artifact_version": metadata.get("artifact_version"), **result}
+
+
+def _artifact_root() -> Path:
+    return Path(os.environ.get("CHANGE_RESULT_ARTIFACT_DIR", "uploads/change_result_artifacts"))
+
+
+def _artifact_path(row, artifact_name: str) -> tuple[Path, str]:
+    metadata = getattr(row, "artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=404, detail="变化结果 artifact 不存在")
+    item = next(
+        (
+            value
+            for key, value in metadata.items()
+            if key != "artifact_version"
+            and isinstance(value, dict)
+            and value.get("filename") == artifact_name
+        ),
+        None,
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="变化结果 artifact 不存在")
+    root = _artifact_root().resolve()
+    path = (root / str(row.id) / artifact_name).resolve()
+    if path.parent != (root / str(row.id)).resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="变化结果 artifact 文件不存在")
+    return path, item["media_type"]
 
 
 def _history_result_status(row) -> str:
@@ -354,6 +402,20 @@ async def get_change_history(
             {"result_id": result_id, "status": "INCOMPLETE"},
         )
     return api_response(200, "查询成功", _serialize(row, row.request_id))
+
+
+@router.get("/history/{result_id}/artifacts/{artifact_name}")
+async def get_change_history_artifact(
+    result_id: int,
+    artifact_name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    row = await crud_results.get_succeeded_history_by_id(db, result_id, current_user.id)
+    if row is None or _history_result_status(row) == "INCOMPLETE":
+        raise HTTPException(status_code=404, detail="历史记录不存在或无权访问")
+    path, media_type = _artifact_path(row, artifact_name)
+    return FileResponse(path, media_type=media_type, filename=artifact_name)
 
 
 def _failure(row, request_id: str):
@@ -551,3 +613,33 @@ async def get_change_result(
     if row is None:
         raise HTTPException(status_code=404, detail="变化分析结果不存在")
     return _response(row, value)
+
+
+@router.get("/{request_id}/artifacts/{artifact_name}")
+async def get_change_result_artifact(
+    request_id: UUID,
+    artifact_name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    value = str(request_id)
+    row = await crud_results.get_by_request(db, value, current_user.id)
+    if row is None or row.status != crud_results.SUCCEEDED:
+        raise HTTPException(status_code=404, detail="变化结果不存在或尚未完成")
+    path, media_type = _artifact_path(row, artifact_name)
+    return FileResponse(path, media_type=media_type, filename=artifact_name)
+
+
+@router.get("/{request_id}/artifacts")
+async def get_change_result_artifacts(
+    request_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    value = str(request_id)
+    row = await crud_results.get_by_request(db, value, current_user.id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="变化结果不存在")
+    if row.status != crud_results.SUCCEEDED:
+        return api_response(409, "变化结果尚未完成", {"status": row.status})
+    return api_response(200, "查询成功", _serialize_artifacts(row))
