@@ -200,6 +200,7 @@ def test_report_includes_persisted_transition_artifact_and_snapshot(report_case,
 
 def test_legacy_report_marks_missing_multi_value_transition_artifact(report_case, monkeypatch):
     client, row, _, _ = report_case
+    row.artifact_metadata = {}
     captured = {}
     monkeypatch.setattr(change_report, "build_pdf", lambda report: captured.update(report) or b"%PDF-1.4")
 
