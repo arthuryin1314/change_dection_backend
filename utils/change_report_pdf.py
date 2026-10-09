@@ -93,7 +93,8 @@ PAGE_MARGIN_VERTICAL = 16 * mm
 def _matrix_col_widths(n_classes):
     available_width = A4[0] - 2 * PAGE_MARGIN_HORIZONTAL
     label_width = 25 * mm
-    value_width = (available_width - label_width) / n_classes
+    # Leave a tiny rounding margin so ReportLab's float widths cannot exceed A4.
+    value_width = (available_width - label_width - 0.01) / n_classes
     return [label_width] + [value_width] * n_classes
 
 def _table(rows, widths):
@@ -106,6 +107,56 @@ def _fit_image(data, max_width, max_height):
         scale = min(max_width / source.width, max_height / source.height)
         width, height = source.width * scale, source.height * scale
     return Image(io.BytesIO(data), width=width, height=height)
+
+
+def _legend_table(legend, paragraph):
+    rows = [[paragraph("统一图例"), paragraph("颜色"), paragraph("编码")]]
+    classes = legend.get("classes", []) if isinstance(legend, dict) else []
+    for item in classes:
+        if not isinstance(item, dict):
+            continue
+        color = item.get("color") or ""
+        rows.append([paragraph(item.get("name")), paragraph(color), paragraph(item.get("id"))])
+    transitions = legend.get("transitions", []) if isinstance(legend, dict) else []
+    for item in transitions:
+        if not isinstance(item, dict):
+            continue
+        before = item.get("before") or {}
+        after = item.get("after") or {}
+        label = f"{before.get('name', '未记录')} → {after.get('name', '未记录')}"
+        rows.append([paragraph(label), paragraph(item.get("color")), paragraph(item.get("code"))])
+    return _table(rows, [95 * mm, 40 * mm, 30 * mm])
+
+
+def _transition_stats_table(snapshot, legend, paragraph, unit):
+    rows = [[paragraph("前期 → 后期"), paragraph("像素数"), paragraph(f"面积（{LABELS[unit]}）")]]
+    areas = snapshot.get("transition_area_m2") if isinstance(snapshot, dict) else None
+    counts = snapshot.get("transition_pixel_counts") if isinstance(snapshot, dict) else None
+    transitions = legend.get("transitions", []) if isinstance(legend, dict) else []
+    seen_codes = set()
+    if isinstance(areas, list) and isinstance(counts, list):
+        for item in transitions:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("code")
+            if not isinstance(code, int) or code < 0 or code >= len(areas) or code >= len(counts):
+                continue
+            seen_codes.add(code)
+            before = item.get("before") or {}
+            after = item.get("after") or {}
+            label = f"{before.get('name', '未记录')} → {after.get('name', '未记录')}"
+            rows.append([paragraph(label), paragraph(counts[code]), paragraph(format_area_m2(areas[code], unit))])
+        for code, (area, count) in enumerate(zip(areas, counts)):
+            if code in seen_codes or (area == 0 and count == 0):
+                continue
+            rows.append([paragraph(f"编码 {code}"), paragraph(count), paragraph(format_area_m2(area, unit))])
+    if len(rows) == 1:
+        rows.append([paragraph("无已记录有向转移"), paragraph("0"), paragraph("0")])
+    for label, key in (("未变化", "unchanged"), ("无效／NoData", "nodata")):
+        value = snapshot.get(f"{key}_area_m2") if isinstance(snapshot, dict) else None
+        count = snapshot.get(f"{key}_pixel_count") if isinstance(snapshot, dict) else None
+        rows.append([paragraph(label), paragraph(count), paragraph(format_area_m2(value, unit))])
+    return _table(rows, [95 * mm, 30 * mm, 40 * mm])
 
 
 def _image_grid(report, paragraph):
@@ -140,6 +191,18 @@ def build_pdf(report):
     rows.append([p("模型"),p(report["model"]),p(report["model"])])
     story.append(_table(rows,[35*mm,65*mm,65*mm]))
     story += [PageBreak(), p("两期影像与分类图", heading), _image_grid(report, p)]
+    story += [PageBreak(), p("有向转移结果", heading)]
+    if report.get("transition_png") is None:
+        story.append(p(report.get("legacy_transition_note")))
+    else:
+        story += [
+            p("主图使用本次变化检测持久化 artifact；图例和统计均沿用同一份结果快照。"),
+            _fit_image(report["transition_png"], 174 * mm, 105 * mm),
+            Spacer(1, 8),
+            _legend_table(report["transition_legend"], p),
+            Spacer(1, 8),
+            _transition_stats_table(report["transition_snapshot"], report["transition_legend"], p, report["unit"]),
+        ]
     story += [PageBreak(),p("面积与转移矩阵",heading),p(f"面积单位：{LABELS[report['unit']]}；单期面积统计整幅有效区域，矩阵统计共同有效区域。")]
     rows = [[p("类别"),p("前期"),p("后期")]]
     for i,item in enumerate(report["classes"]):

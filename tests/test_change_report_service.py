@@ -3,6 +3,7 @@ import hashlib
 import os
 from datetime import datetime, timezone
 from io import BytesIO
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -150,3 +151,61 @@ def test_report_rejects_mismatched_image_hash(report_case, monkeypatch):
 
     assert response.status_code == 409
     assert 'before' in response.text and 'image' in response.text
+
+
+def test_report_includes_persisted_transition_artifact_and_snapshot(report_case, monkeypatch, tmp_path):
+    client, row, _, _ = report_case
+    artifact_root = tmp_path / "change-artifacts"
+    artifact_dir = artifact_root / str(row.id)
+    artifact_dir.mkdir(parents=True)
+    from PIL import Image
+
+    image = Image.new("RGBA", (1800, 900), (255, 0, 0, 255))
+    image.save(artifact_dir / "visualization.png")
+    legend = {
+        "artifact_version": "change-artifacts-v1",
+        "classification_scheme_version": "land-cover-6/v1",
+        "classes": [{"id": 0, "name": "其他／背景", "color": "#000000"}],
+        "transitions": [{"code": 1, "before": {"id": 0, "name": "其他／背景"}, "after": {"id": 1, "name": "水系"}, "color": "#e6194b"}],
+    }
+    (artifact_dir / "legend.json").write_text(json.dumps(legend, ensure_ascii=False), encoding="utf-8")
+    row.artifact_metadata = {
+        "artifact_version": "change-artifacts-v1",
+        "visualization_png": {"filename": "visualization.png"},
+        "legend": {"filename": "legend.json"},
+    }
+    row.transition_snapshot = {
+        "classification_scheme_version": "land-cover-6/v1",
+        "nodata_value": 255,
+        "transition_pixel_counts": [0, 1] + [0] * 34,
+        "transition_area_m2": [0.0, 100.0] + [0.0] * 34,
+        "unchanged_pixel_count": 2,
+        "unchanged_area_m2": 200.0,
+        "nodata_pixel_count": 1,
+        "nodata_area_m2": 100.0,
+    }
+    monkeypatch.setenv("CHANGE_RESULT_ARTIFACT_DIR", str(artifact_root))
+    captured = {}
+    monkeypatch.setattr(change_report, "build_pdf", lambda report: captured.update(report) or b"%PDF-1.4")
+
+    response = client.get('/api/change-results/history/150/report.pdf?unit=ha')
+
+    assert response.status_code == 200
+    assert captured["transition_snapshot"] == row.transition_snapshot
+    assert captured["transition_legend"] == legend
+    assert captured["transition_png"]
+    with Image.open(BytesIO(captured["transition_png"])) as rendered:
+        assert max(rendered.size) <= 1600
+
+
+def test_legacy_report_marks_missing_multi_value_transition_artifact(report_case, monkeypatch):
+    client, row, _, _ = report_case
+    captured = {}
+    monkeypatch.setattr(change_report, "build_pdf", lambda report: captured.update(report) or b"%PDF-1.4")
+
+    response = client.get('/api/change-results/history/150/report.pdf')
+
+    assert response.status_code == 200
+    assert captured["transition_snapshot"] is None
+    assert captured["transition_legend"] is None
+    assert "未保存多值转移结果" in captured["legacy_transition_note"]
