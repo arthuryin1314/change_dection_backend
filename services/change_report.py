@@ -76,10 +76,8 @@ def _read_artifact_image(path):
 
 def _load_transition_artifact(row):
     metadata = getattr(row, "artifact_metadata", None)
-    if metadata is None or metadata == {}:
+    if not isinstance(metadata, dict) or not metadata:
         return None
-    if not isinstance(metadata, dict):
-        raise ReportError(409, "报告所需资源缺失", [{"resource": "transition_artifact"}])
     image_path = _artifact_path(row, "visualization_png")
     legend_path = _artifact_path(row, "legend")
     snapshot = getattr(row, "transition_snapshot", None)
