@@ -21,8 +21,9 @@ from utils.change_result_errors import (
     RESULT_CONTRACT_BROKEN,
     SPATIAL_METADATA_UNAVAILABLE,
 )
-from utils.classification_storage import RasterGrid
+from utils.classification_contract import CLASSIFICATION_SCHEME_VERSION
 from utils.classification_result_lock import classification_result_lock
+from utils.classification_storage import RasterGrid
 from utils.pixel_area import UnsupportedAreaGridError, pixel_area_axis_m2
 
 
@@ -34,6 +35,7 @@ GDAL_CACHE_BYTES = 128 * 1024 * 1024
 GRID_POLICY_VERSION = "aligned-grid-v1"
 CALCULATION_VERSION = "transition-matrix-v2"
 EDGE_RULE = "target_pixel_center_full_cell"
+NODATA_VALUE = 255
 
 
 class TransitionMatrixError(ValueError):
@@ -46,6 +48,14 @@ class TransitionMatrixError(ValueError):
 class TransitionMatrixResult:
     matrix_m2: list[list[float]]
     common_valid_area_m2: float
+    transition_pixel_counts: list[int]
+    transition_area_m2: list[float]
+    unchanged_pixel_count: int
+    unchanged_area_m2: float
+    nodata_pixel_count: int
+    nodata_area_m2: float
+    nodata_value: int
+    classification_scheme_version: str
     grid: RasterGrid
     bounds: list[float]
     before_window: list[int] | None
@@ -504,6 +514,52 @@ def _accumulate_window(
     return int(before_values.size)
 
 
+def _accumulate_directed_stats(
+    transition_pixel_counts: np.ndarray,
+    transition_area_m2: np.ndarray,
+    before_classes: np.ndarray,
+    before_valid: np.ndarray,
+    after_classes: np.ndarray,
+    after_valid: np.ndarray,
+    *,
+    axis: str,
+    pixel_areas: np.ndarray,
+    row_off: int,
+    col_off: int,
+) -> tuple[int, float, int, float]:
+    valid = (before_valid == 1) & (after_valid == 1)
+    changed = valid & (before_classes != after_classes)
+    unchanged = valid & ~changed
+    nodata = ~valid
+    pairs = (
+        before_classes.astype(np.int64) * CLASS_COUNT
+        + after_classes.astype(np.int64)
+    )
+    area_axis = pixel_areas[col_off : col_off + before_classes.shape[1]]
+    if axis == "column":
+        areas = np.broadcast_to(area_axis[np.newaxis, :], before_classes.shape)
+    else:
+        area_axis = pixel_areas[row_off : row_off + before_classes.shape[0]]
+        areas = np.broadcast_to(area_axis[:, np.newaxis], before_classes.shape)
+    changed_pairs = pairs[changed]
+    if changed_pairs.size:
+        transition_pixel_counts += np.bincount(
+            changed_pairs,
+            minlength=CLASS_COUNT**2,
+        )
+        transition_area_m2 += np.bincount(
+            changed_pairs,
+            weights=areas[changed],
+            minlength=CLASS_COUNT**2,
+        )
+    return (
+        int(np.count_nonzero(unchanged)),
+        float(areas[unchanged].sum()),
+        int(np.count_nonzero(nodata)),
+        float(areas[nodata].sum()),
+    )
+
+
 def _locked_result_directories(paths: list[str | Path]):
     stack = ExitStack()
     for directory in sorted({str(Path(path).parent.resolve()) for path in paths}):
@@ -586,6 +642,12 @@ def compute_transition_matrix_m2(
 
             axis_length = grid.width if axis == "column" else grid.height
             counts = np.zeros((CLASS_COUNT**2, axis_length), dtype=np.int64)
+            transition_pixel_counts = np.zeros(CLASS_COUNT**2, dtype=np.int64)
+            transition_area_m2 = np.zeros(CLASS_COUNT**2, dtype=np.float64)
+            unchanged_pixel_count = 0
+            unchanged_area_m2 = 0.0
+            nodata_pixel_count = 0
+            nodata_area_m2 = 0.0
             common_valid_pixels = 0
             for row_off in range(0, grid.height, window_size):
                 height = min(window_size, grid.height - row_off)
@@ -632,6 +694,27 @@ def compute_transition_matrix_m2(
                         row_off=row_off,
                         col_off=col_off,
                     )
+                    (
+                        unchanged_pixels,
+                        unchanged_area,
+                        nodata_pixels,
+                        nodata_area,
+                    ) = _accumulate_directed_stats(
+                        transition_pixel_counts,
+                        transition_area_m2,
+                        before_classes_data,
+                        before_valid_data,
+                        after_classes_data,
+                        after_valid_data,
+                        axis=axis,
+                        pixel_areas=pixel_areas,
+                        row_off=row_off,
+                        col_off=col_off,
+                    )
+                    unchanged_pixel_count += unchanged_pixels
+                    unchanged_area_m2 += unchanged_area
+                    nodata_pixel_count += nodata_pixels
+                    nodata_area_m2 += nodata_area
     except TimeoutError as exc:
         raise TransitionMatrixError(
             IDENTIFICATION_RESULT_BUSY,
@@ -647,6 +730,14 @@ def compute_transition_matrix_m2(
     return TransitionMatrixResult(
         matrix_m2=matrix.tolist(),
         common_valid_area_m2=float(matrix.sum()),
+        transition_pixel_counts=transition_pixel_counts.tolist(),
+        transition_area_m2=transition_area_m2.tolist(),
+        unchanged_pixel_count=unchanged_pixel_count,
+        unchanged_area_m2=unchanged_area_m2,
+        nodata_pixel_count=nodata_pixel_count,
+        nodata_area_m2=nodata_area_m2,
+        nodata_value=NODATA_VALUE,
+        classification_scheme_version=CLASSIFICATION_SCHEME_VERSION,
         grid=grid,
         bounds=list(bounds),
         before_window=(

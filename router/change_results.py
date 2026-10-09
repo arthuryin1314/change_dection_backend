@@ -189,6 +189,27 @@ def _period_status(row, period: str) -> dict:
     return {"status": "PENDING"}
 
 
+def _serialize_transition(row) -> dict | None:
+    snapshot = getattr(row, "transition_snapshot", None)
+    if isinstance(snapshot, dict):
+        return dict(snapshot)
+    values = {
+        "classification_scheme_version": getattr(
+            row, "classification_scheme_version", None
+        ),
+        "nodata_value": getattr(row, "nodata_value", None),
+        "transition_pixel_counts": getattr(row, "transition_pixel_counts", None),
+        "transition_area_m2": getattr(row, "transition_area_m2", None),
+        "unchanged_pixel_count": getattr(row, "unchanged_pixel_count", None),
+        "unchanged_area_m2": getattr(row, "unchanged_area_m2", None),
+        "nodata_pixel_count": getattr(row, "nodata_pixel_count", None),
+        "nodata_area_m2": getattr(row, "nodata_area_m2", None),
+    }
+    if all(value is None for value in values.values()):
+        return None
+    return values
+
+
 def _serialize(row, request_id: str) -> dict:
     data = {
         "result_id": row.id,
@@ -209,6 +230,7 @@ def _serialize(row, request_id: str) -> dict:
         "completed_at": _iso(row.completed_at),
     }
     if row.status == crud_results.SUCCEEDED:
+        transition = _serialize_transition(row)
         data.update(
             {
                 "classes": ordered_class_definitions(),
@@ -216,6 +238,7 @@ def _serialize(row, request_id: str) -> dict:
                 "after": _normalize_snapshot(row.after_snapshot),
                 "matrix_m2": row.matrix_m2,
                 "common_valid_area_m2": row.common_valid_area_m2,
+                "transition": transition,
                 "before_window": row.before_window,
                 "after_window": row.after_window,
                 "analysis": {
