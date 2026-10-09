@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import tempfile
+import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -8,6 +10,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -325,6 +328,88 @@ def _artifact_path(row, artifact_name: str) -> tuple[Path, str]:
     return path, item["media_type"]
 
 
+_DOWNLOAD_ARTIFACTS = {
+    "transition_geotiff",
+    "visualization_png",
+    "legend",
+}
+_DOWNLOAD_FILENAMES = {
+    "transition_geotiff": "transition.tif",
+    "visualization_png": "visualization.png",
+    "legend": "legend.json",
+}
+
+
+def _download_artifact_paths(row) -> list[tuple[str, Path]]:
+    """Resolve the persisted artifact set without deriving a new result."""
+    metadata = getattr(row, "artifact_metadata", None)
+    if not isinstance(metadata, dict) or metadata.get("artifact_version") is None:
+        raise HTTPException(status_code=404, detail="该变化结果没有可下载的 artifact（legacy 结果）")
+    root = _artifact_root().resolve()
+    result_directory = (root / str(row.id)).resolve()
+    if result_directory.parent != root:
+        raise HTTPException(status_code=404, detail="变化结果 artifact 不存在")
+
+    paths = []
+    for key, item in metadata.items():
+        if key == "artifact_version":
+            continue
+        if key not in _DOWNLOAD_ARTIFACTS or not isinstance(item, dict):
+            continue
+        filename = item.get("filename")
+        if filename != _DOWNLOAD_FILENAMES[key] or Path(filename).name != filename:
+            raise HTTPException(status_code=404, detail="变化结果 artifact 不存在")
+        path = (result_directory / filename).resolve()
+        if path.parent != result_directory or not path.is_file():
+            raise HTTPException(status_code=404, detail="变化结果 artifact 文件不存在")
+        paths.append((filename, path))
+
+    if len(paths) != 3 or {filename for filename, _ in paths} != {
+        "transition.tif",
+        "visualization.png",
+        "legend.json",
+    }:
+        raise HTTPException(status_code=404, detail="变化结果 artifact 不完整，无法下载")
+    return paths
+
+
+def _zip_download_response(row) -> FileResponse:
+    paths = _download_artifact_paths(row)
+    root = _artifact_root().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    file_descriptor, archive_name = tempfile.mkstemp(
+        prefix=f".change-result-{row.id}-",
+        suffix=".zip",
+        dir=root,
+    )
+    os.close(file_descriptor)
+    try:
+        with zipfile.ZipFile(archive_name, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for filename, path in paths:
+                archive.write(path, arcname=filename)
+    except BaseException:
+        try:
+            os.unlink(archive_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+    return FileResponse(
+        archive_name,
+        media_type="application/zip",
+        filename=f"change-result-{row.id}.zip",
+        headers={"Cache-Control": "no-store"},
+        background=BackgroundTask(_remove_download_archive, archive_name),
+    )
+
+
+def _remove_download_archive(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def _history_result_status(row) -> str:
     if row.matrix_m2 is None or row.calculated_at is None:
         return "INCOMPLETE"
@@ -416,6 +501,18 @@ async def get_change_history_artifact(
         raise HTTPException(status_code=404, detail="历史记录不存在或无权访问")
     path, media_type = _artifact_path(row, artifact_name)
     return FileResponse(path, media_type=media_type, filename=artifact_name)
+
+
+@router.get("/history/{result_id}/download.zip")
+async def download_change_history_artifacts(
+    result_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    row = await crud_results.get_succeeded_history_by_id(db, result_id, current_user.id)
+    if row is None or _history_result_status(row) == "INCOMPLETE":
+        raise HTTPException(status_code=404, detail="历史记录不存在或无权访问")
+    return _zip_download_response(row)
 
 
 def _failure(row, request_id: str):
@@ -628,6 +725,18 @@ async def get_change_result_artifact(
         raise HTTPException(status_code=404, detail="变化结果不存在或尚未完成")
     path, media_type = _artifact_path(row, artifact_name)
     return FileResponse(path, media_type=media_type, filename=artifact_name)
+
+
+@router.get("/{request_id}/download.zip")
+async def download_change_result_artifacts(
+    request_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    row = await crud_results.get_by_request(db, str(request_id), current_user.id)
+    if row is None or row.status != crud_results.SUCCEEDED:
+        raise HTTPException(status_code=404, detail="变化结果不存在或尚未完成")
+    return _zip_download_response(row)
 
 
 @router.get("/{request_id}/artifacts")

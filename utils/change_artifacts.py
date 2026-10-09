@@ -6,6 +6,7 @@ PNG is only a display derivative and must never be used for statistics.
 
 import json
 import shutil
+from contextlib import ExitStack
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from utils.classification_contract import (
     CLASS_NAMES,
 )
 from utils.classification_render import CLASS_COLORS
+from utils.classification_result_lock import classification_result_lock
 from utils.transition_matrix import (
     CLASS_COUNT,
     _read_aligned_pair,
@@ -46,28 +48,24 @@ _TRANSITION_COLORS = {
         11: (250, 190, 190),
         12: (0, 128, 128),
         13: (230, 190, 255),
-        14: (170, 110, 40),
         15: (255, 250, 200),
         16: (128, 0, 0),
         17: (170, 255, 195),
         18: (128, 128, 0),
         19: (255, 215, 180),
         20: (0, 0, 128),
-        21: (128, 128, 128),
         22: (255, 255, 255),
         23: (100, 100, 100),
         24: (40, 40, 40),
         25: (180, 180, 180),
         26: (80, 80, 80),
         27: (200, 100, 100),
-        28: (100, 200, 100),
         29: (100, 100, 200),
         30: (200, 200, 100),
         31: (100, 200, 200),
         32: (200, 100, 200),
         33: (150, 150, 50),
         34: (50, 150, 150),
-        35: (150, 50, 150),
     }.items()
 }
 
@@ -239,29 +237,38 @@ def write_change_artifacts(
             "BIGTIFF": "IF_SAFER",
         }
         actual_codes = set()
-        with rasterio.open(
-            before_classes_path
-        ) as before_classes, rasterio.open(
-            before_valid_mask_path
-        ) as before_valid, rasterio.open(
-            after_classes_path
-        ) as after_classes, rasterio.open(
-            after_valid_mask_path
-        ) as after_valid, rasterio.open(transition_path, "w", **profile) as output:
-            for row_off, col_off, height, width in _windows(result):
-                transition = _read_transition_window(
-                    before_classes,
-                    before_valid,
-                    after_classes,
-                    after_valid,
-                    result,
-                    row_off,
-                    col_off,
-                    height,
-                    width,
-                )
-                output.write(transition, 1, window=Window(col_off, row_off, width, height))
-                actual_codes.update(int(code) for code in np.unique(transition) if code != NODATA_VALUE)
+        source_paths = (
+            before_classes_path,
+            before_valid_mask_path,
+            after_classes_path,
+            after_valid_mask_path,
+        )
+        with ExitStack() as locks:
+            for directory in sorted({str(Path(path).parent.resolve()) for path in source_paths}):
+                locks.enter_context(classification_result_lock(directory, timeout_seconds=2))
+            with rasterio.open(
+                before_classes_path
+            ) as before_classes, rasterio.open(
+                before_valid_mask_path
+            ) as before_valid, rasterio.open(
+                after_classes_path
+            ) as after_classes, rasterio.open(
+                after_valid_mask_path
+            ) as after_valid, rasterio.open(transition_path, "w", **profile) as output:
+                for row_off, col_off, height, width in _windows(result):
+                    transition = _read_transition_window(
+                        before_classes,
+                        before_valid,
+                        after_classes,
+                        after_valid,
+                        result,
+                        row_off,
+                        col_off,
+                        height,
+                        width,
+                    )
+                    output.write(transition, 1, window=Window(col_off, row_off, width, height))
+                    actual_codes.update(int(code) for code in np.unique(transition) if code != NODATA_VALUE)
 
         visualization_path = temporary_directory / "visualization.png"
         visual_width, visual_height = _write_visualization(transition_path, visualization_path)
@@ -273,7 +280,6 @@ def write_change_artifacts(
         temporary_directory.replace(final_directory)
     except BaseException:
         shutil.rmtree(temporary_directory, ignore_errors=True)
-        shutil.rmtree(final_directory, ignore_errors=True)
         raise
 
     return {
