@@ -14,7 +14,7 @@ os.environ.setdefault(
 
 from utils.classification_storage import RasterGrid
 from utils.transition_matrix import compute_transition_matrix_m2
-from utils.change_artifacts import write_change_artifacts
+from utils.change_artifacts import _TRANSITION_COLORS, write_change_artifacts
 from router.change_results import _serialize_artifacts
 
 
@@ -96,6 +96,11 @@ def test_change_artifacts_publish_transition_raster_png_and_actual_legend(tmp_pa
     assert not list((tmp_path / "artifacts").glob(".41.*.tmp"))
 
 
+def test_transition_color_table_contains_only_directed_non_diagonal_codes():
+    assert len(_TRANSITION_COLORS) == 30
+    assert not ({0, 7, 14, 21, 28, 35} & _TRANSITION_COLORS.keys())
+
+
 def test_change_artifacts_failure_removes_temporary_directory(tmp_path):
     before = _write(
         tmp_path / "before",
@@ -121,6 +126,39 @@ def test_change_artifacts_failure_removes_temporary_directory(tmp_path):
         )
     assert not (tmp_path / "artifacts" / "42").exists()
     assert not list((tmp_path / "artifacts").glob(".42.*.tmp"))
+
+
+def test_change_artifacts_failure_does_not_remove_a_competing_published_directory(tmp_path, monkeypatch):
+    before = _write(
+        tmp_path / "before",
+        np.array([[0, 1]], dtype=np.uint8),
+        np.array([[1, 1]], dtype=np.uint8),
+    )
+    after = _write(
+        tmp_path / "after",
+        np.array([[1, 1]], dtype=np.uint8),
+        np.array([[1, 1]], dtype=np.uint8),
+    )
+    matrix = compute_transition_matrix_m2(*before, *after)
+    final_directory = tmp_path / "artifacts" / "43"
+    def competing_replace(path, target):
+        final_directory.mkdir(parents=True)
+        (final_directory / "winner").write_text("published", encoding="utf-8")
+        raise FileExistsError("competing writer won")
+
+    monkeypatch.setattr(Path, "replace", competing_replace)
+    with np.testing.assert_raises(FileExistsError):
+        write_change_artifacts(
+            before_classes_path=before[0],
+            before_valid_mask_path=before[1],
+            after_classes_path=after[0],
+            after_valid_mask_path=after[1],
+            result=matrix,
+            storage_root=tmp_path / "artifacts",
+            result_id="43",
+        )
+    assert (final_directory / "winner").read_text(encoding="utf-8") == "published"
+    assert not list((tmp_path / "artifacts").glob(".43.*.tmp"))
 
 
 def test_result_details_expose_authenticated_artifact_urls():

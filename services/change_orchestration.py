@@ -432,6 +432,16 @@ async def _heartbeat(result_id: int, user_id: int, owner: str) -> None:
             await db.commit()
 
 
+async def _await_artifact_task(artifact_task: asyncio.Task):
+    """Wait for a thread-backed artifact write even when its caller is cancelled."""
+    try:
+        return await asyncio.shield(artifact_task)
+    except asyncio.CancelledError:
+        with suppress(asyncio.CancelledError):
+            await asyncio.shield(artifact_task)
+        raise
+
+
 async def _cleanup_unpublished_artifacts(result_id: int) -> None:
     """Remove files unless the result row was durably marked succeeded."""
     try:
@@ -602,16 +612,19 @@ async def _execute(result_id: int, user_id: int, owner: str) -> None:
             now=_now(),
         ):
             return
-    artifact_metadata = await asyncio.to_thread(
-        write_change_artifacts,
-        before_classes_path=resolved.before.classes_path,
-        before_valid_mask_path=resolved.before.valid_mask_path,
-        after_classes_path=resolved.after.classes_path,
-        after_valid_mask_path=resolved.after.valid_mask_path,
-        result=result,
-        storage_root=ARTIFACT_ROOT,
-        result_id=result_id,
+    artifact_task = asyncio.create_task(
+        asyncio.to_thread(
+            write_change_artifacts,
+            before_classes_path=resolved.before.classes_path,
+            before_valid_mask_path=resolved.before.valid_mask_path,
+            after_classes_path=resolved.after.classes_path,
+            after_valid_mask_path=resolved.after.valid_mask_path,
+            result=result,
+            storage_root=ARTIFACT_ROOT,
+            result_id=result_id,
+        )
     )
+    artifact_metadata = await _await_artifact_task(artifact_task)
     async with AsyncSessionLocal() as db:
         row = await change_crud.get_by_id(db, result_id)
         if row is None:
