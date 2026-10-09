@@ -421,6 +421,16 @@ def _owned_processing_request_by_id(result_id: int, user_id: int, owner: str):
 
 
 async def mark_succeeded(db, *, request_id, user_id, owner, resolved, result, now):
+    transition_snapshot = {
+        "classification_scheme_version": result.classification_scheme_version,
+        "nodata_value": result.nodata_value,
+        "transition_pixel_counts": result.transition_pixel_counts,
+        "transition_area_m2": result.transition_area_m2,
+        "unchanged_pixel_count": result.unchanged_pixel_count,
+        "unchanged_area_m2": result.unchanged_area_m2,
+        "nodata_pixel_count": result.nodata_pixel_count,
+        "nodata_area_m2": result.nodata_area_m2,
+    }
     identity_payload = {
         "before_identity_sha256": resolved.before.identity_sha256,
         "after_identity_sha256": resolved.after.identity_sha256,
@@ -434,6 +444,8 @@ async def mark_succeeded(db, *, request_id, user_id, owner, resolved, result, no
             "bounds": result.bounds,
         },
         "analysis": result.analysis,
+        "classification_scheme_version": result.classification_scheme_version,
+        "nodata_value": result.nodata_value,
     }
     analysis_identity_sha256 = hashlib.sha256(
         json.dumps(
@@ -453,6 +465,15 @@ async def mark_succeeded(db, *, request_id, user_id, owner, resolved, result, no
         "after_snapshot": resolved.after_snapshot,
         "matrix_m2": result.matrix_m2,
         "common_valid_area_m2": result.common_valid_area_m2,
+        "transition_pixel_counts": result.transition_pixel_counts,
+        "transition_area_m2": result.transition_area_m2,
+        "unchanged_pixel_count": result.unchanged_pixel_count,
+        "unchanged_area_m2": result.unchanged_area_m2,
+        "nodata_pixel_count": result.nodata_pixel_count,
+        "nodata_area_m2": result.nodata_area_m2,
+        "nodata_value": result.nodata_value,
+        "classification_scheme_version": result.classification_scheme_version,
+        "transition_snapshot": transition_snapshot,
         "crs": str(result.grid.crs),
         "transform": list(result.grid.transform)[:6],
         "raster_width": result.grid.width,

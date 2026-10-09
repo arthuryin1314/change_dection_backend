@@ -179,6 +179,24 @@ def test_post_always_returns_202_and_schedules_new_task():
     schedule.assert_called_once_with(41, 7, "owner")
 
 
+def test_succeeded_result_exposes_persisted_directed_transition_snapshot():
+    row = _succeeded()
+    row.transition_snapshot = {
+        "classification_scheme_version": "land-cover-6/v1",
+        "nodata_value": 255,
+        "transition_pixel_counts": [0, 1] + [0] * 34,
+        "transition_area_m2": [0.0, 100.0] + [0.0] * 34,
+        "unchanged_pixel_count": 2,
+        "unchanged_area_m2": 200.0,
+        "nodata_pixel_count": 1,
+        "nodata_area_m2": 100.0,
+    }
+    assert (
+        change_results._serialize(row, REQUEST_ID)["transition"]
+        == row.transition_snapshot
+    )
+
+
 def test_post_freezes_source_names_with_submitted_inputs():
     client, _ = _client()
     before = SimpleNamespace(
