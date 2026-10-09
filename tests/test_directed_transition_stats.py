@@ -55,4 +55,3 @@ def test_directed_transition_stats_use_36_slots_and_keep_nodata_separate(tmp_pat
     assert sum(result.transition_pixel_counts) == 1
     assert result.nodata_value == 255
     assert result.classification_scheme_version == "land-cover-6/v1"
-
