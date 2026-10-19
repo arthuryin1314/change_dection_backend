@@ -498,6 +498,67 @@ def test_area_request_computes_saved_grid_and_commits_complete_summary(tmp_path)
     assert saved.await_args.kwargs["completed_at"] == row.completed_at
 
 
+def test_area_requests_serialize_large_raster_scans(tmp_path):
+    rows = {
+        "before": _stored_result(tmp_path / "before"),
+        "after": _stored_result(tmp_path / "after"),
+    }
+    for row in rows.values():
+        row.id = row.id + row.id
+        row.area_status = "NOT_COMPUTED"
+        row.class_area_m2 = None
+
+    active = 0
+    peak = 0
+
+    async def lookup(db, result_id, user_id):
+        return rows[result_id]
+
+    async def save(*args, **kwargs):
+        return True
+
+    def scan(*args):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        import time
+
+        time.sleep(0.02)
+        active -= 1
+        return [1, 2, 3, 4, 5, 6]
+
+    async def run():
+        original_semaphore = identification_results._classification_raster_semaphore
+        identification_results._classification_raster_semaphore = asyncio.Semaphore(1)
+        with patch.object(
+            identification_results.crud_results,
+            "get_result_by_id",
+            new=lookup,
+        ), patch.object(
+            identification_results.crud_results,
+            "mark_area_succeeded",
+            new=save,
+        ), patch.object(
+            identification_results,
+            "summarize_classification_area_m2",
+            new=scan,
+        ):
+            try:
+                await asyncio.gather(
+                    identification_results.calculate_identification_result_areas(
+                        "before", "c" * 64, FakeDatabase(), SimpleNamespace(id=7)
+                    ),
+                    identification_results.calculate_identification_result_areas(
+                        "after", "c" * 64, FakeDatabase(), SimpleNamespace(id=7)
+                    ),
+                )
+            finally:
+                identification_results._classification_raster_semaphore = original_semaphore
+
+    asyncio.run(run())
+    assert peak == 1
+
+
 def test_area_request_rejects_result_replaced_during_scan(tmp_path):
     client, db = _make_client()
     row = _stored_result(tmp_path)

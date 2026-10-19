@@ -49,6 +49,10 @@ RESULT_STORAGE_ROOT = Path(
     os.environ.get("CLASSIFICATION_RESULT_DIR", "uploads/classification_results")
 )
 _generation_tasks: dict[str, set[asyncio.Task]] = {}
+# Rasterio/GDAL can make large temporary allocations while reading a result.
+# Keep result reads serial so concurrent area and render requests cannot exhaust
+# or destabilize the Uvicorn worker at the same time.
+_classification_raster_semaphore = asyncio.Semaphore(1)
 
 
 class CreateIdentificationResultRequest(BaseModel):
@@ -579,11 +583,12 @@ async def calculate_identification_result_areas(
     generation_completed_at = row.completed_at
     await db.rollback()
     try:
-        areas = await asyncio.to_thread(
-            summarize_classification_area_m2,
-            classes_path,
-            valid_mask_path,
-        )
+        async with _classification_raster_semaphore:
+            areas = await asyncio.to_thread(
+                summarize_classification_area_m2,
+                classes_path,
+                valid_mask_path,
+            )
     except TimeoutError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -681,7 +686,8 @@ async def render_identification_result(
                     classes=selected,
                 )
 
-        image = await asyncio.to_thread(render_under_lock)
+        async with _classification_raster_semaphore:
+            image = await asyncio.to_thread(render_under_lock)
     except (RenderBoundsError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return Response(content=image, media_type="image/png")
