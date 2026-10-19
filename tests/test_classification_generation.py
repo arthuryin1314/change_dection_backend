@@ -1,5 +1,7 @@
 import asyncio
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -393,3 +395,42 @@ def test_lost_lease_at_publication_fences_stale_worker(tmp_path, monkeypatch):
     assert lifecycle.failure == "lease lost before publish"
     assert lifecycle.succeeded is None
     assert not (request.storage_root / request.result_id).exists()
+
+
+def test_concurrent_generations_are_queued_before_high_memory_stage(monkeypatch, tmp_path):
+    active = 0
+    peak_active = 0
+    entered = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+
+    def fake_generation(*args, **kwargs):
+        nonlocal active, peak_active
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            entered.set()
+        try:
+            assert release.wait(2)
+            return object()
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(generation, "_generate_classification_files_unlocked", fake_generation)
+    first_source = tmp_path / "source-1.tif"
+    second_source = tmp_path / "source-2.tif"
+    _write_source(first_source)
+    _write_source(second_source)
+    first = _request(tmp_path, first_source)
+    second = replace(first, result_id="result-2", image_path=second_source)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_task = executor.submit(generation.generate_classification_files, first)
+        assert entered.wait(2)
+        second_task = executor.submit(generation.generate_classification_files, second)
+        time.sleep(0.05)
+        release.set()
+        first_task.result()
+        second_task.result()
+    assert peak_active == 1

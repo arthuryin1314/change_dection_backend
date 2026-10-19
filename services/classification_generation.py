@@ -5,7 +5,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Semaphore
 from time import perf_counter
 from typing import Callable, Mapping, Protocol
 from uuid import uuid4
@@ -31,6 +31,10 @@ from utils.streaming_classification import (
 
 HEARTBEAT_INTERVAL_SECONDS = 60
 logger = logging.getLogger(__name__)
+# Complete classification generations can hold several gigabytes of raster and
+# model memory. Keep the high-memory stage queued per worker process; the lease
+# heartbeat continues while a task waits for this slot.
+_generation_semaphore = Semaphore(1)
 
 
 @dataclass(frozen=True)
@@ -288,13 +292,14 @@ def generate_classification_files(
     publication_guard: Callable[[], None] | None = None,
 ) -> GenerationOutcome:
     result_directory = Path(request.storage_root) / request.result_id
-    with classification_result_lock(result_directory):
-        return _generate_classification_files_unlocked(
-            request,
-            progress_callback=progress_callback,
-            cancellation_event=cancellation_event,
-            publication_guard=publication_guard,
-        )
+    with _generation_semaphore:
+        with classification_result_lock(result_directory):
+            return _generate_classification_files_unlocked(
+                request,
+                progress_callback=progress_callback,
+                cancellation_event=cancellation_event,
+                publication_guard=publication_guard,
+            )
 
 
 async def _heartbeat_loop(lifecycle: GenerationLifecycle) -> None:

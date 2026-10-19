@@ -166,7 +166,8 @@ def test_model_cache_is_keyed_by_weight_content_not_database_id_or_path():
             )
 
         assert constructor.call_count == 2
-        assert len(deeplab_service._model_cache) == 2
+        assert len(deeplab_service._model_cache) == 1
+        assert all(key.weight_sha256 == "b" * 64 for key in deeplab_service._model_cache)
     finally:
         deeplab_service.clear_model_cache()
 

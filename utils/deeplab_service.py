@@ -16,7 +16,9 @@ from utils.classification_contract import PIPELINE_VERSION
 from utils.predict_large_image import SlidingWindowPredictor
 from utils.utils import cvtColor
 
-MODEL_CACHE_CAPACITY = 2
+# A single inactive model is enough for result reuse and prevents multiple
+# large weight tensors from remaining resident between queued generations.
+MODEL_CACHE_CAPACITY = 1
 
 
 @dataclass(frozen=True)
