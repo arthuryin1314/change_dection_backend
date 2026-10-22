@@ -671,7 +671,7 @@ async def render_identification_result(
     row = await crud_results.get_result_by_id(db, result_id, current_user.id)
     if row is None:
         raise HTTPException(status_code=404, detail="识别结果不存在")
-    if row.status != SUCCEEDED or not await asyncio.to_thread(_row_is_reusable, row):
+    if row.status != SUCCEEDED:
         raise HTTPException(status_code=409, detail="识别结果尚不可用")
     try:
         def render_under_lock():
@@ -687,7 +687,12 @@ async def render_identification_result(
                 )
 
         async with _classification_raster_semaphore:
+            # Validation takes the same file lock as area scans; queue it too.
+            if not await asyncio.to_thread(_row_is_reusable, row):
+                raise HTTPException(status_code=409, detail="识别结果尚不可用")
             image = await asyncio.to_thread(render_under_lock)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (RenderBoundsError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return Response(content=image, media_type="image/png")

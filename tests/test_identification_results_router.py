@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import io
 import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import pytest
+from httpx import ASGITransport, AsyncClient
 from rasterio.crs import CRS as RasterioCRS
 from rasterio.transform import array_bounds
 from affine import Affine
@@ -31,6 +34,7 @@ from services.identification_results import (
 from utils.classification_contract import inference_parameters
 from utils.classification_storage import RasterGrid, write_classification_result
 from utils.get_user_by_token import get_current_user
+from utils import classification_area
 
 
 class FakeDatabase:
@@ -664,6 +668,84 @@ def test_render_rejects_failed_or_unready_result(tmp_path):
         )
 
     assert response.status_code == 409
+
+def test_first_render_waits_for_area_scan_then_history_and_reuse_render(tmp_path):
+    rows = {period: _stored_result(tmp_path / period) for period in ("before", "after")}
+    for period, row in rows.items():
+        row.id = period
+        row.area_status = "NOT_COMPUTED"
+        row.class_area_m2 = None
+    acquired = threading.Event()
+    release = threading.Event()
+    original_lock = classification_area.classification_result_lock
+
+    @contextmanager
+    def hold_area_lock(*args, **kwargs):
+        with original_lock(*args, **kwargs):
+            acquired.set()
+            assert release.wait(10), "area scan was not released"
+            yield
+
+    async def lookup(db, result_id, user_id):
+        return rows[result_id]
+
+    async def save(db, **kwargs):
+        row = rows[kwargs["result_id"]]
+        row.area_status = SUCCEEDED
+        row.class_area_m2 = kwargs["class_area_m2"]
+        row.area_completed_at = kwargs["area_completed_at"]
+        return True
+
+    async def run():
+        client, _ = _make_client()
+        with patch.object(identification_results, "_classification_raster_semaphore", asyncio.Semaphore(1)), patch.object(
+            identification_results.crud_results, "get_result_by_id", new=lookup,
+        ), patch.object(
+            identification_results.crud_results, "mark_area_succeeded", new=save,
+        ), patch.object(classification_area, "classification_result_lock", new=hold_area_lock):
+            async with AsyncClient(transport=ASGITransport(app=client.app, raise_app_exceptions=False), base_url="http://test") as http:
+                params = {"bbox": "110,29.99,110.02,30", "width": 2, "height": 1, "classes": [0, 1]}
+                area = asyncio.create_task(http.post("/api/identification-results/before/areas", params={"identity_sha256": "c" * 64}))
+                try:
+                    assert await asyncio.to_thread(acquired.wait, 5)
+
+                    async def finish_scan():
+                        # Exceed the real validation lock timeout, as a first large scan does.
+                        await asyncio.sleep(2.2)
+                        release.set()
+
+                    before, after, _ = await asyncio.gather(
+                        http.get("/api/identification-results/before/render", params=params),
+                        http.get("/api/identification-results/after/render", params=params),
+                        finish_scan(),
+                    )
+                    assert (await area).status_code == 200
+                    assert [before.status_code, after.status_code] == [200, 200]
+                    assert np.asarray(Image.open(io.BytesIO(before.content)))[:, :, 3].any()
+                    history = await http.get("/api/identification-results/before/render", params=params)
+                    assert history.status_code == 200
+                    cached_area = await http.post("/api/identification-results/before/areas", params={"identity_sha256": "c" * 64})
+                    assert cached_area.status_code == 200
+                    reused = await http.get("/api/identification-results/before/render", params=params)
+                    assert reused.content == history.content == before.content
+                finally:
+                    release.set()
+                    await area
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("busy_step", ["_row_is_reusable", "render_classification_png"])
+def test_render_maps_busy_file_lock_to_retryable_409(tmp_path, busy_step):
+    client, _ = _make_client()
+    row = _stored_result(tmp_path)
+    with patch.object(identification_results.crud_results, "get_result_by_id", new=AsyncMock(return_value=row)), patch.object(
+        identification_results, busy_step, side_effect=TimeoutError("等待识别结果文件锁超时"),
+    ):
+        response = client.get("/api/identification-results/result-1/render", params={"bbox": "110,29.99,110.02,30", "width": 2, "height": 1})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "等待识别结果文件锁超时"
+
 
 def test_resolve_unavailable_result_does_not_invalidate_or_write(tmp_path):
     client, db = _make_client()
