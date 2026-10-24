@@ -519,11 +519,12 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
             assert history.status_code == 200
             assert history.json()["data"]["total"] == 1
             assert history.json()["data"]["items"][0]["result_id"] == data["result_id"]
+            assert history.json()["data"]["items"][0]["model_available"] is True
             history_detail = reloaded_client.get(
                 f"/api/change-results/history/{data['result_id']}"
             )
             assert history_detail.status_code == 200
-            assert history_detail.json()["data"] == data
+            assert history_detail.json()["data"] == {**data, "model_available": True}
 
             conflicting = reloaded_client.post(
                 "/api/change-results",

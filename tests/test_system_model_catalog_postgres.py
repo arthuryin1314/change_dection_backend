@@ -93,6 +93,46 @@ def test_migration_clears_only_legacy_catalog_and_preserves_history(catalog):
         assert cursor.fetchone() == (0,)
 
 
+def test_fresh_orm_catalog_generates_ids_and_accepts_production_version(catalog):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from models.Base import Base
+    from models.system_models import SystemModel, SystemModelVersion
+
+    connection, client, _ = catalog
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT current_schema()")
+        schema = cursor.fetchone()[0]
+        # Only these tables in the fixture's disposable schema are replaced.
+        cursor.execute("DROP TABLE system_models, system_model_versions CASCADE")
+    engine = create_engine(
+        os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1),
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    try:
+        Base.metadata.create_all(engine, tables=[SystemModel.__table__, SystemModelVersion.__table__])
+        with Session(engine) as session:
+            model = SystemModel(model_name="自动建表模型", model_type="land-cover")
+            session.add(model)
+            session.flush()
+            version = SystemModelVersion(
+                model_id=model.id, version="v1", status="AVAILABLE", framework="PyTorch",
+                input_description="RGB", code_config_sha256="a" * 64,
+                weight_sha256="b" * 64, image_digest="sha256:" + "c" * 64,
+            )
+            session.add(version)
+            session.flush()
+            model.production_version_id = version.id
+            session.commit()
+            model_id, version_id = model.id, version.id
+        item = client.get("/api/models/list").json()["data"]["items"][0]
+        assert item["id"] == model_id
+        assert item["production_version_id"] == version_id
+        assert item["version"]["id"] == version_id
+    finally:
+        engine.dispose()
+
+
 def test_catalog_is_global_and_filters_before_pagination(catalog):
     connection, client, user = catalog
     with connection.cursor() as cursor:

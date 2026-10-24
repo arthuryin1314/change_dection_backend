@@ -19,7 +19,8 @@ class SystemModel(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    # This ID also participates in the production-version FK; keep its own sequence.
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement="ignore_fk")
     model_name: Mapped[str] = mapped_column(String(255))
     model_type: Mapped[Literal["land-cover", "change-detection"]] = mapped_column(String(32))
     description: Mapped[str | None] = mapped_column(Text)
