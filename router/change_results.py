@@ -20,6 +20,7 @@ from crud import images as crud_images
 from crud import ml_models as crud_models
 from services.change_orchestration import schedule_change_orchestration
 from services.change_report import ReportError, build_change_report
+from services.inference_runtime import InferenceUnavailableError
 from utils.change_result_errors import (
     CHANGE_RESULT_NOT_RETRYABLE,
     REQUEST_ID_CONFLICT,
@@ -582,11 +583,21 @@ async def _claim(
     return api_response(202, "变化分析任务已接收", _serialize(claim.row, request_id))
 
 
+class ChangeDetectionDisabledError(InferenceUnavailableError):
+    error_code = "CHANGE_DETECTION_DISABLED"
+    message = "第一阶段暂不支持新建变化检测任务"
+
+
+def require_change_creation() -> None:
+    raise ChangeDetectionDisabledError()
+
+
 @router.post("")
 async def create_change_result(
     payload: CreateChangeResultRequest,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
+    _creation_enabled: None = Depends(require_change_creation),
 ):
     user_id = current_user.id
     request_id = str(payload.request_id)
@@ -633,6 +644,7 @@ async def retry_change_result(
     payload: RetryChangeResultRequest,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
+    _creation_enabled: None = Depends(require_change_creation),
 ):
     user_id = current_user.id
     original_request_id = str(request_id)

@@ -11,6 +11,8 @@ import rasterio
 from affine import Affine
 
 from services import classification_generation as generation
+from services.inference_runtime import InferenceUnavailableError
+from tests.fake_inference_runtime import FakeInferenceRuntime
 from utils.content_hash import resolve_content_sha256
 
 
@@ -78,10 +80,10 @@ def test_programmatic_generation_persists_native_grid_and_spatial_metadata(
 ):
     source_path = tmp_path / "source.tif"
     _write_source(source_path)
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
 
     outcome = generation.generate_classification_files(
-        _request(tmp_path, source_path)
+        _request(tmp_path, source_path), runtime=runtime
     )
 
     assert outcome.metadata.width == 6
@@ -105,13 +107,27 @@ def test_programmatic_generation_persists_native_grid_and_spatial_metadata(
     assert np.all(classes[valid == 1] == 5)
 
 
+def test_unavailable_runtime_marks_generation_failed_without_publishing(tmp_path):
+    source_path = tmp_path / "source.tif"
+    _write_source(source_path)
+    request = _request(tmp_path, source_path)
+    lifecycle = RecordingLifecycle()
+
+    with pytest.raises(InferenceUnavailableError, match="推理服务暂不可用"):
+        asyncio.run(generation.run_generation(request, lifecycle))
+
+    assert lifecycle.succeeded is None
+    assert lifecycle.failure == "推理服务暂不可用"
+    assert not (request.storage_root / request.result_id).exists()
+
+
 def test_programmatic_generation_writes_every_streamed_band(tmp_path, monkeypatch):
     source_path = tmp_path / "source.tif"
     _write_source(source_path, height=900)
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
 
     outcome = generation.generate_classification_files(
-        _request(tmp_path, source_path)
+        _request(tmp_path, source_path), runtime=runtime
     )
 
     with rasterio.open(outcome.stored.classes_path) as classes_ds:
@@ -131,13 +147,13 @@ def test_programmatic_generation_uses_frozen_inference_parameters(
 ):
     source_path = tmp_path / "source.tif"
     _write_source(source_path)
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
     request = replace(
         _request(tmp_path, source_path),
         inference_parameters={"tile_size": 4, "overlap": 1},
     )
 
-    outcome = generation.generate_classification_files(request)
+    outcome = generation.generate_classification_files(request, runtime=runtime)
 
     assert outcome.metrics.effective_tiles == 4
 
@@ -148,11 +164,11 @@ def test_database_success_transition_happens_only_after_files_are_readable(
 ):
     source_path = tmp_path / "source.tif"
     _write_source(source_path)
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
     lifecycle = RecordingLifecycle()
 
     outcome = asyncio.run(
-        generation.run_generation(_request(tmp_path, source_path), lifecycle)
+        generation.run_generation(_request(tmp_path, source_path), lifecycle, runtime=runtime)
     )
 
     assert lifecycle.succeeded is outcome
@@ -173,12 +189,12 @@ def test_generation_failure_is_marked_failed_without_visible_files(
 
         yield predict
 
-    monkeypatch.setattr(generation, "model_tile_predictor", failing_predictor)
+    runtime = FakeInferenceRuntime(failing_predictor)
     lifecycle = RecordingLifecycle()
 
     with pytest.raises(RuntimeError, match="inference failed"):
         asyncio.run(
-            generation.run_generation(_request(tmp_path, source_path), lifecycle)
+            generation.run_generation(_request(tmp_path, source_path), lifecycle, runtime=runtime)
         )
 
     assert lifecycle.succeeded is None
@@ -194,9 +210,9 @@ def test_retry_replaces_a_corrupt_published_directory(tmp_path, monkeypatch):
     corrupt.mkdir(parents=True)
     (corrupt / "classes.tif").write_bytes(b"truncated")
     (corrupt / "valid_mask.tif").write_bytes(b"truncated")
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
 
-    outcome = generation.generate_classification_files(request)
+    outcome = generation.generate_classification_files(request, runtime=runtime)
 
     with rasterio.open(outcome.stored.classes_path) as dataset:
         assert dataset.width == 6
@@ -216,7 +232,7 @@ def test_cleanup_failure_after_publish_keeps_generation_successful(
     corrupt.mkdir(parents=True)
     (corrupt / "classes.tif").write_bytes(b"truncated")
     (corrupt / "valid_mask.tif").write_bytes(b"truncated")
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
     original_rmtree = generation.shutil.rmtree
 
     def fail_quarantine_cleanup(path):
@@ -226,7 +242,7 @@ def test_cleanup_failure_after_publish_keeps_generation_successful(
 
     monkeypatch.setattr(generation.shutil, "rmtree", fail_quarantine_cleanup)
 
-    outcome = generation.generate_classification_files(request)
+    outcome = generation.generate_classification_files(request, runtime=runtime)
 
     assert outcome.stored.classes_path.exists()
     assert "旧识别结果隔离目录清理失败" in caplog.text
@@ -255,10 +271,10 @@ def test_failed_rebuild_restores_quarantined_result(tmp_path, monkeypatch):
 
         yield predict
 
-    monkeypatch.setattr(generation, "model_tile_predictor", failing_predictor)
+    runtime = FakeInferenceRuntime(failing_predictor)
 
     with pytest.raises(RuntimeError, match="rebuild failed"):
-        generation.generate_classification_files(request)
+        generation.generate_classification_files(request, runtime=runtime)
 
     assert classes_path.read_bytes() == b"original classes"
     assert mask_path.read_bytes() == b"original mask"
@@ -290,10 +306,10 @@ def test_failed_old_worker_never_replaces_a_concurrently_published_result(
 
         yield predict
 
-    monkeypatch.setattr(generation, "model_tile_predictor", losing_predictor)
+    runtime = FakeInferenceRuntime(losing_predictor)
 
     with pytest.raises(RuntimeError, match="old worker lost"):
-        generation.generate_classification_files(request)
+        generation.generate_classification_files(request, runtime=runtime)
 
     assert (existing / "new-marker").read_text(encoding="utf-8") == "published"
     assert not (existing / "old-marker").exists()
@@ -338,11 +354,11 @@ def test_cancelling_generation_stops_worker_before_publish(tmp_path, monkeypatch
 
         yield predict
 
-    monkeypatch.setattr(generation, "model_tile_predictor", blocking_predictor)
+    runtime = FakeInferenceRuntime(blocking_predictor)
     lifecycle = RecordingLifecycle()
 
     async def cancel_running_generation():
-        task = asyncio.create_task(generation.run_generation(request, lifecycle))
+        task = asyncio.create_task(generation.run_generation(request, lifecycle, runtime=runtime))
         assert await asyncio.to_thread(entered.wait, 2)
         task.cancel()
         release.set()
@@ -359,7 +375,7 @@ def test_heartbeat_failure_stops_worker_and_prevents_publish(tmp_path, monkeypat
     source_path = tmp_path / "source.tif"
     _write_source(source_path, height=900)
     request = _request(tmp_path, source_path)
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
     lifecycle = RecordingLifecycle()
 
     async def failing_heartbeat():
@@ -368,7 +384,7 @@ def test_heartbeat_failure_stops_worker_and_prevents_publish(tmp_path, monkeypat
     lifecycle.heartbeat = failing_heartbeat
 
     with pytest.raises(RuntimeError, match="lease renewal failed"):
-        asyncio.run(generation.run_generation(request, lifecycle))
+        asyncio.run(generation.run_generation(request, lifecycle, runtime=runtime))
 
     assert lifecycle.failure == "lease renewal failed"
     assert lifecycle.succeeded is None
@@ -379,7 +395,7 @@ def test_lost_lease_at_publication_fences_stale_worker(tmp_path, monkeypatch):
     source_path = tmp_path / "source.tif"
     _write_source(source_path)
     request = _request(tmp_path, source_path)
-    monkeypatch.setattr(generation, "model_tile_predictor", _fake_predictor)
+    runtime = FakeInferenceRuntime(_fake_predictor)
     lifecycle = RecordingLifecycle()
 
     async def lose_lease_on_publication():
@@ -390,7 +406,7 @@ def test_lost_lease_at_publication_fences_stale_worker(tmp_path, monkeypatch):
     lifecycle.heartbeat = lose_lease_on_publication
 
     with pytest.raises(RuntimeError, match="lease lost before publish"):
-        asyncio.run(generation.run_generation(request, lifecycle))
+        asyncio.run(generation.run_generation(request, lifecycle, runtime=runtime))
 
     assert lifecycle.failure == "lease lost before publish"
     assert lifecycle.succeeded is None

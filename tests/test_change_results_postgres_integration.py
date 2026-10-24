@@ -24,7 +24,8 @@ load_dotenv()
 from config.db_config import AsyncSessionLocal, async_engine, get_db
 from crud import change_results as change_result_crud
 from router import change_results
-from services import classification_generation
+from services import change_orchestration
+from tests.fake_inference_runtime import FakeInferenceRuntime
 from services.identification_results import ResultIdentity
 from utils.classification_contract import inference_parameters
 from utils.classification_storage import RasterGrid, write_classification_result
@@ -38,7 +39,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _isolate_async_connection_pool():
+def _isolate_async_connection_pool(monkeypatch, tmp_path):
+    # A disposable database restarts IDs at 1, so its files need isolation too.
+    monkeypatch.setattr(change_orchestration, "ARTIFACT_ROOT", tmp_path / "artifacts")
+    monkeypatch.setattr(change_orchestration, "SNAPSHOT_ROOT", tmp_path / "snapshots")
+    monkeypatch.setenv("CHANGE_RESULT_ARTIFACT_DIR", str(tmp_path / "artifacts"))
     asyncio.run(async_engine.dispose(close=False))
     yield
     asyncio.run(async_engine.dispose(close=False))
@@ -469,6 +474,8 @@ def test_postgres_change_api_persists_reloads_deduplicates_and_authorizes(tmp_pa
     }
     app = FastAPI()
     app.include_router(change_results.router)
+    # Exercise retained orchestration with a fake runtime behind the phase-one gate.
+    app.dependency_overrides[change_results.require_change_creation] = lambda: None
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=seeded["user_id"])
 
     try:
@@ -570,9 +577,9 @@ def test_postgres_orchestration_reuses_or_generates_each_missing_period(
         yield predict
 
     monkeypatch.setattr(
-        classification_generation,
-        "model_tile_predictor",
-        recording_predictor,
+        change_orchestration,
+        "get_inference_runtime",
+        lambda: FakeInferenceRuntime(recording_predictor),
     )
     monkeypatch.setenv(
         "CLASSIFICATION_RESULT_DIR",
@@ -592,6 +599,8 @@ def test_postgres_orchestration_reuses_or_generates_each_missing_period(
     }
     app = FastAPI()
     app.include_router(change_results.router)
+    # Exercise retained orchestration with a fake runtime behind the phase-one gate.
+    app.dependency_overrides[change_results.require_change_creation] = lambda: None
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=seeded["user_id"]
     )
@@ -786,9 +795,9 @@ def test_postgres_changed_image_bytes_do_not_reuse_old_classification(
         ),
     )
     monkeypatch.setattr(
-        classification_generation,
-        "model_tile_predictor",
-        _fake_predictor,
+        change_orchestration,
+        "get_inference_runtime",
+        lambda: FakeInferenceRuntime(_fake_predictor),
     )
     monkeypatch.setenv(
         "CLASSIFICATION_RESULT_DIR",
@@ -802,6 +811,8 @@ def test_postgres_changed_image_bytes_do_not_reuse_old_classification(
     request_id = str(uuid4())
     app = FastAPI()
     app.include_router(change_results.router)
+    # Exercise retained orchestration with a fake runtime behind the phase-one gate.
+    app.dependency_overrides[change_results.require_change_creation] = lambda: None
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=seeded["user_id"]
     )
@@ -846,9 +857,9 @@ def test_postgres_identification_failure_can_retry_with_new_request_id(
         yield predict
 
     monkeypatch.setattr(
-        classification_generation,
-        "model_tile_predictor",
-        failing_predictor,
+        change_orchestration,
+        "get_inference_runtime",
+        lambda: FakeInferenceRuntime(failing_predictor),
     )
     monkeypatch.setenv(
         "CLASSIFICATION_RESULT_DIR",
@@ -863,6 +874,8 @@ def test_postgres_identification_failure_can_retry_with_new_request_id(
     retry_id = str(uuid4())
     app = FastAPI()
     app.include_router(change_results.router)
+    # Exercise retained orchestration with a fake runtime behind the phase-one gate.
+    app.dependency_overrides[change_results.require_change_creation] = lambda: None
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=seeded["user_id"]
     )
@@ -888,9 +901,9 @@ def test_postgres_identification_failure_can_retry_with_new_request_id(
 
             seeded["before_source"].unlink()
             monkeypatch.setattr(
-                classification_generation,
-                "model_tile_predictor",
-                _fake_predictor,
+                change_orchestration,
+                "get_inference_runtime",
+                lambda: FakeInferenceRuntime(_fake_predictor),
             )
             retried = client.post(
                 f"/api/change-results/{request_id}/retry",
@@ -982,6 +995,8 @@ def test_postgres_matrix_retry_reuses_both_periods_after_pipeline_upgrade(
     retry_id = str(uuid4())
     app = FastAPI()
     app.include_router(change_results.router)
+    # Exercise retained orchestration with a fake runtime behind the phase-one gate.
+    app.dependency_overrides[change_results.require_change_creation] = lambda: None
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=seeded["user_id"]
     )
@@ -1046,6 +1061,8 @@ def test_postgres_waiting_for_owned_identification_has_a_busy_budget(
     request_id = str(uuid4())
     app = FastAPI()
     app.include_router(change_results.router)
+    # Exercise retained orchestration with a fake runtime behind the phase-one gate.
+    app.dependency_overrides[change_results.require_change_creation] = lambda: None
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=seeded["user_id"]
     )

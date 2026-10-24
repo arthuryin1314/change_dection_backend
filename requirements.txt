@@ -13,6 +13,7 @@ geoalchemy2>=0.15.2        # 空间字段支持
 
 # 密码加密
 passlib[bcrypt]>=1.7.4
+bcrypt>=3.2.2,<4.1        # 兼容现有 passlib 1.7.4 的后端初始化和密码校验
 
 # 环境变量管理
 python-dotenv>=1.0.0
@@ -25,10 +26,7 @@ pyproj>=3.7.0              # 像元地表面积与坐标系比例因子
 # 可选：Redis 缓存（如果用到）
 redis>=5.0.1
 
-# 地物识别（DeepLabV3+）
-torch>=2.0.0
-torchvision>=0.15.0
-opencv-python>=4.8.0
+# 栅格处理和历史结果展示（推理框架由独立 Worker 管理）
 Pillow>=10.0.0
 numpy>=1.24.0
 reportlab>=5.0.0

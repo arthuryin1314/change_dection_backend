@@ -24,6 +24,7 @@ from PIL import Image
 
 from config.db_config import get_db
 from router import identification_results
+from tests.fake_inference_runtime import FakeInferenceRuntime
 from services.identification_results import (
     PROCESSING,
     SUCCEEDED,
@@ -62,6 +63,7 @@ def _make_client(db=None, current_user=None):
 
     app = FastAPI()
     app.include_router(identification_results.router)
+    app.dependency_overrides[identification_results.get_inference_runtime] = FakeInferenceRuntime
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[get_current_user] = lambda: user
     return TestClient(app), database
@@ -78,8 +80,9 @@ class ExpiringCurrentUser:
         return 7
 
 
-def _sources():
-    weight_path = Path(__file__).parents[1] / "weights" / "best_epoch_weights.pth"
+def _sources(tmp_path):
+    weight_path = tmp_path / "fixture.pth"
+    weight_path.write_bytes(b"fake weight for source identity")
     image = SimpleNamespace(
         id=1,
         user_id=7,
@@ -120,10 +123,10 @@ def _claim(status=PROCESSING, should_start=True):
     )
 
 
-def test_post_returns_202_and_schedules_only_after_database_commit():
+def test_post_returns_202_and_schedules_only_after_database_commit(tmp_path):
     client, db = _make_client()
-    image, model = _sources()
-    scheduled = Mock(side_effect=lambda request, owner: setattr(db, "scheduled_after_commit", db.committed))
+    image, model = _sources(tmp_path)
+    scheduled = Mock(side_effect=lambda request, owner, runtime: setattr(db, "scheduled_after_commit", db.committed))
 
     with patch.object(
         identification_results.crud_images,
@@ -152,9 +155,9 @@ def test_post_returns_202_and_schedules_only_after_database_commit():
     scheduled.assert_called_once()
 
 
-def test_post_captures_source_names_outside_result_identity():
+def test_post_captures_source_names_outside_result_identity(tmp_path):
     client, _ = _make_client()
-    image, model = _sources()
+    image, model = _sources(tmp_path)
     store = Mock()
 
     with patch.object(
@@ -205,9 +208,9 @@ def test_old_generation_callback_does_not_unregister_replacement_task():
         identification_results._generation_tasks.pop("result-1", None)
 
 
-def test_post_reuses_succeeded_identity_without_scheduling():
+def test_post_reuses_succeeded_identity_without_scheduling(tmp_path):
     client, _ = _make_client()
-    image, model = _sources()
+    image, model = _sources(tmp_path)
 
     with patch.object(
         identification_results.crud_images,
@@ -306,7 +309,7 @@ def _stored_result(tmp_path, *, status=SUCCEEDED, grid=None):
 
 def test_resolve_returns_complete_identity_match_without_writing_database(tmp_path):
     client, db = _make_client()
-    image, model = _sources()
+    image, model = _sources(tmp_path)
     row = _stored_result(tmp_path)
     matched = _claim(SUCCEEDED, False).record
     lookup = AsyncMock(return_value=matched)
@@ -344,6 +347,7 @@ def test_resolve_returns_complete_identity_match_without_writing_database(tmp_pa
 
 def test_history_lists_saved_results_and_reads_detail_without_writing(tmp_path):
     client, db = _make_client()
+    del client.app.dependency_overrides[identification_results.get_inference_runtime]
     row = _stored_result(tmp_path)
 
     with patch.object(
@@ -402,9 +406,9 @@ def test_history_detail_reports_missing_saved_files_without_invalidating_result(
     invalidate.assert_not_awaited()
 
 
-def test_resolve_missing_identity_does_not_create_or_schedule_result():
+def test_resolve_missing_identity_does_not_create_or_schedule_result(tmp_path):
     client, db = _make_client()
-    image, model = _sources()
+    image, model = _sources(tmp_path)
 
     with patch.object(
         identification_results.crud_images,
@@ -435,10 +439,10 @@ def test_resolve_missing_identity_does_not_create_or_schedule_result():
     scheduled.assert_not_called()
 
 
-def test_resolve_snapshots_current_user_before_releasing_read_transaction():
+def test_resolve_snapshots_current_user_before_releasing_read_transaction(tmp_path):
     db = FakeDatabase()
     client, _ = _make_client(db, ExpiringCurrentUser(db))
-    image, model = _sources()
+    image, model = _sources(tmp_path)
 
     with patch.object(
         identification_results.crud_images,
@@ -749,7 +753,7 @@ def test_render_maps_busy_file_lock_to_retryable_409(tmp_path, busy_step):
 
 def test_resolve_unavailable_result_does_not_invalidate_or_write(tmp_path):
     client, db = _make_client()
-    image, model = _sources()
+    image, model = _sources(tmp_path)
     row = _stored_result(tmp_path)
 
     with patch.object(
@@ -875,7 +879,7 @@ def test_reusability_validation_is_offloaded_from_async_request_loop():
 
 def test_resolve_recomputes_changed_source_hash_without_persisting_cache(tmp_path):
     client, db = _make_client()
-    image, model = _sources()
+    image, model = _sources(tmp_path)
     changed_source = tmp_path / "changed-source.tif"
     changed_source.write_bytes(b"changed-image-content")
     image.img_path = str(changed_source)
@@ -932,7 +936,7 @@ def test_resolve_exposes_matching_unready_status_without_writing(
     expected,
 ):
     client, db = _make_client()
-    image, model = _sources()
+    image, model = _sources(tmp_path)
     row = _stored_result(tmp_path, status=status)
     row.failure_detail = failure_detail
 
@@ -964,8 +968,8 @@ def test_resolve_exposes_matching_unready_status_without_writing(
     assert db.committed is False
 
 
-def test_change_resolver_distinguishes_previous_source_version():
-    image, model = _sources()
+def test_change_resolver_distinguishes_previous_source_version(tmp_path):
+    image, model = _sources(tmp_path)
     db = FakeDatabase()
     old = SimpleNamespace(id="old-version")
 

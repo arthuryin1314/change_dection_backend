@@ -21,6 +21,7 @@ from services.classification_generation import (
     run_generation,
 )
 from services.generation_lifecycle import SqlAlchemyGenerationLifecycle
+from services.inference_runtime import get_inference_runtime
 from services.identification_results import (
     FAILED,
     PROCESSING,
@@ -373,7 +374,7 @@ async def _ensure_classification(
             claim.record.lease_owner,
         )
         try:
-            await run_generation(request, lifecycle)
+            await run_generation(request, lifecycle, runtime=get_inference_runtime())
         except InputVersionChangedError as exc:
             raise InputVersionError(str(exc)) from exc
         except Exception as exc:

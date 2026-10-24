@@ -42,6 +42,8 @@ def _client(user_id=7):
 
     app = FastAPI()
     app.include_router(change_results.router)
+    # Exercise retained orchestration contracts independently of the phase-one gate.
+    app.dependency_overrides[change_results.require_change_creation] = lambda: None
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
     return TestClient(app), database
@@ -597,6 +599,7 @@ def test_get_other_users_request_returns_404():
 
 def test_history_lists_complete_and_legacy_results_without_writing():
     client, db = _client()
+    del client.app.dependency_overrides[change_results.require_change_creation]
     complete = _succeeded()
     legacy = _succeeded()
     legacy.id = 40
@@ -659,6 +662,7 @@ def test_history_detail_rejects_incomplete_legacy_result_before_serializing():
 
 def test_history_detail_returns_optional_grid_without_expiring_task():
     client, db = _client()
+    del client.app.dependency_overrides[change_results.require_change_creation]
     row = _succeeded()
 
     with patch.object(

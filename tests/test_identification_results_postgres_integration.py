@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from config.db_config import get_db
 from router import identification_results
+from tests.fake_inference_runtime import FakeInferenceRuntime
 from utils.get_user_by_token import get_current_user
 
 
@@ -204,10 +205,8 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
     app = FastAPI()
     app.include_router(identification_results.router)
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=user_id)
-    monkeypatch.setattr(
-        "services.classification_generation.model_tile_predictor",
-        _fake_predictor,
-    )
+    runtime = FakeInferenceRuntime(_fake_predictor)
+    app.dependency_overrides[identification_results.get_inference_runtime] = lambda: runtime
     monkeypatch.setattr(
         identification_results,
         "RESULT_STORAGE_ROOT",
@@ -295,6 +294,8 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
             assert rendered.status_code == 200
             assert rendered.headers["content-type"] == "image/png"
 
+            # History stays readable with the production (unavailable) runtime.
+            del app.dependency_overrides[identification_results.get_inference_runtime]
             history = client.get("/api/identification-results/history")
             assert history.status_code == 200
             assert history.json()["data"]["total"] == 1
@@ -311,6 +312,7 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
             )
             assert history_detail.json()["data"]["render_status"] == "AVAILABLE"
 
+            app.dependency_overrides[identification_results.get_inference_runtime] = lambda: runtime
             second_weight = tmp_path / "second.pth"
             second_weight.write_bytes(b"different-integration-weight")
             second_weight.with_suffix(".py").write_text("# fixture", encoding="utf-8")
@@ -329,7 +331,8 @@ def test_postgres_api_create_complete_read_reuse_and_authorization(
             failed_weight.with_suffix(".py").write_text("# fixture", encoding="utf-8")
             failed_model_id = _add_model(user_id, failed_weight)
             monkeypatch.setattr(
-                "services.classification_generation.model_tile_predictor",
+                runtime,
+                "predictor_factory",
                 _failing_predictor,
             )
             failed = client.post(

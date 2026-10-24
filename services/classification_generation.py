@@ -1,8 +1,8 @@
 import asyncio
 import ctypes
 import logging
-import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Semaphore
@@ -11,7 +11,8 @@ from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
 import rasterio
-import torch
+
+from services.inference_runtime import InferenceRuntime, UNAVAILABLE_RUNTIME
 
 from utils.classification_storage import (
     AtomicClassificationWriter,
@@ -20,7 +21,6 @@ from utils.classification_storage import (
     validate_stored_classification,
 )
 from utils.classification_result_lock import classification_result_lock
-from utils.deeplab_service import model_tile_predictor
 from utils.content_hash import resolve_content_sha256
 from utils.streaming_classification import (
     ClassificationGenerationCancelled,
@@ -90,7 +90,7 @@ def _raise_if_cancelled(cancellation_event: Event | None) -> None:
 
 
 def _peak_rss_bytes() -> int:
-    if os.name == "nt":
+    if sys.platform == "win32":
         class ProcessMemoryCounters(ctypes.Structure):
             _fields_ = [
                 ("cb", ctypes.c_ulong),
@@ -129,7 +129,7 @@ def _peak_rss_bytes() -> int:
     import resource
 
     value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return int(value if os.uname().sysname == "Darwin" else value * 1024)
+    return int(value if sys.platform == "darwin" else value * 1024)
 
 
 def _metadata(dataset) -> SpatialMetadata:
@@ -159,6 +159,7 @@ def _metadata(dataset) -> SpatialMetadata:
 def _generate_classification_files_unlocked(
     request: GenerationRequest,
     *,
+    runtime: InferenceRuntime,
     progress_callback: Callable[[StreamingMetrics], None] | None = None,
     cancellation_event: Event | None = None,
     publication_guard: Callable[[], None] | None = None,
@@ -166,8 +167,6 @@ def _generate_classification_files_unlocked(
     _raise_if_cancelled(cancellation_event)
     total_started = perf_counter()
     metrics = StreamingMetrics()
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
     with rasterio.open(request.image_path) as source:
         if source.crs is None:
             raise ValueError("源影像缺少坐标系")
@@ -192,8 +191,6 @@ def _generate_classification_files_unlocked(
         if validate_stored_classification(existing, grid, verify_pixels=False):
             metrics.total_seconds = perf_counter() - total_started
             metrics.peak_rss_bytes = _peak_rss_bytes()
-            if torch.cuda.is_available():
-                metrics.peak_gpu_bytes = torch.cuda.max_memory_allocated()
             return GenerationOutcome(existing, metadata, metrics)
 
         quarantine = None
@@ -204,7 +201,7 @@ def _generate_classification_files_unlocked(
             final_directory.replace(quarantine)
         try:
             model_started = perf_counter()
-            with model_tile_predictor(
+            with runtime.open_predictor(
                 request.weight_file_path,
                 weight_sha256=request.weight_sha256,
             ) as predict_tile:
@@ -268,8 +265,6 @@ def _generate_classification_files_unlocked(
 
     metrics.total_seconds = perf_counter() - total_started
     metrics.peak_rss_bytes = _peak_rss_bytes()
-    if torch.cuda.is_available():
-        metrics.peak_gpu_bytes = torch.cuda.max_memory_allocated()
     return GenerationOutcome(stored, metadata, metrics)
 
 
@@ -287,6 +282,7 @@ def _remove_quarantine_best_effort(path: Path) -> None:
 def generate_classification_files(
     request: GenerationRequest,
     *,
+    runtime: InferenceRuntime = UNAVAILABLE_RUNTIME,
     progress_callback: Callable[[StreamingMetrics], None] | None = None,
     cancellation_event: Event | None = None,
     publication_guard: Callable[[], None] | None = None,
@@ -296,6 +292,7 @@ def generate_classification_files(
         with classification_result_lock(result_directory):
             return _generate_classification_files_unlocked(
                 request,
+                runtime=runtime,
                 progress_callback=progress_callback,
                 cancellation_event=cancellation_event,
                 publication_guard=publication_guard,
@@ -311,6 +308,8 @@ async def _heartbeat_loop(lifecycle: GenerationLifecycle) -> None:
 async def run_generation(
     request: GenerationRequest,
     lifecycle: GenerationLifecycle,
+    *,
+    runtime: InferenceRuntime = UNAVAILABLE_RUNTIME,
 ) -> GenerationOutcome:
     cancellation_event = Event()
     event_loop = asyncio.get_running_loop()
@@ -327,6 +326,7 @@ async def run_generation(
         asyncio.to_thread(
             generate_classification_files,
             request,
+            runtime=runtime,
             cancellation_event=cancellation_event,
             publication_guard=publication_guard,
         )

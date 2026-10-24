@@ -22,6 +22,7 @@ from crud import images as crud_images
 from crud import ml_models as crud_ml_models
 from crud.identification_results import SqlAlchemyClaimStore
 from services.classification_generation import GenerationRequest, run_generation
+from services.inference_runtime import InferenceRuntime, get_inference_runtime
 from services.generation_lifecycle import SqlAlchemyGenerationLifecycle
 from services.identification_results import (
     PROCESSING,
@@ -152,13 +153,15 @@ def _generation_done(result_id: str, task: asyncio.Task) -> None:
         )
 
 
-def _schedule_generation(request: GenerationRequest, lease_owner: str) -> None:
+def _schedule_generation(
+    request: GenerationRequest, lease_owner: str, runtime: InferenceRuntime
+) -> None:
     lifecycle = SqlAlchemyGenerationLifecycle(
         AsyncSessionLocal,
         request.result_id,
         lease_owner,
     )
-    task = asyncio.create_task(run_generation(request, lifecycle))
+    task = asyncio.create_task(run_generation(request, lifecycle, runtime=runtime))
     _generation_tasks.setdefault(request.result_id, set()).add(task)
     task.add_done_callback(lambda done: _generation_done(request.result_id, done))
 
@@ -212,7 +215,9 @@ async def create_identification_result(
     payload: CreateIdentificationResultRequest,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
+    runtime: InferenceRuntime = Depends(get_inference_runtime),
 ):
+    runtime.ensure_available()
     image = await crud_images.get_image_by_id(db, payload.image_id, current_user.id)
     if image is None:
         raise HTTPException(status_code=404, detail="影像不存在")
@@ -269,7 +274,7 @@ async def create_identification_result(
             inference_parameters=inference_parameters(),
             storage_root=RESULT_STORAGE_ROOT,
         )
-        _schedule_generation(request, lease_owner)
+        _schedule_generation(request, lease_owner, runtime)
 
     return api_response(
         202,

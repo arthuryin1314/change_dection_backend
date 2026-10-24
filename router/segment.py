@@ -15,7 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.db_config import get_db
 from crud import images as crud_images
 from crud import ml_models as crud_ml_models
-from utils import deeplab_service
+from services.inference_runtime import (
+    InferenceRuntime,
+    InferenceUnavailableError,
+    ModelLoadError,
+    get_inference_runtime,
+)
 from utils.get_user_by_token import get_current_user
 from utils.response import success_response
 from utils.tif_reader import NoOverlapError, UnsupportedSrsError, _cap_dimensions, read_tif_rgb_window
@@ -97,8 +102,10 @@ async def segment_image(
     payload: SegmentRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user=Depends(get_current_user),
+    runtime: InferenceRuntime = Depends(get_inference_runtime),
 ):
     try:
+        runtime.ensure_available()
         image = await crud_images.get_image_by_id(db, payload.image_id, current_user.id)
         if image is None:
             raise HTTPException(status_code=404, detail="影像不存在")
@@ -138,14 +145,14 @@ async def segment_image(
 
         try:
             result_png = await asyncio.to_thread(
-                deeplab_service.segment_rgba_png,
+                runtime.segment_rgba_png,
                 tif_result.image,
                 payload.model_id,
                 model.weight_file_path,
                 payload.classes,
                 weight_sha256=model.weight_content_sha256,
             )
-        except deeplab_service.ModelLoadError as exc:
+        except ModelLoadError as exc:
             logger.warning(
                 "模型权重不兼容: model_id=%s weight_file_path=%s",
                 payload.model_id,
@@ -169,7 +176,7 @@ async def segment_image(
                 "bbox": payload.bbox,
             },
         )
-    except HTTPException:
+    except (HTTPException, InferenceUnavailableError):
         raise
     except Exception:
         logger.exception(

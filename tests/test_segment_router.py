@@ -16,6 +16,9 @@ from PIL import Image
 
 from config.db_config import get_db
 from router import segment
+from tests.fake_inference_runtime import FakeInferenceRuntime
+
+_runtime = FakeInferenceRuntime()
 from utils.get_user_by_token import get_current_user
 from utils.tif_reader import NoOverlapError, TifReadResult, UnsupportedSrsError
 
@@ -50,6 +53,7 @@ def _model(
 def _make_client() -> TestClient:
     app = FastAPI()
     app.include_router(segment.router)
+    app.dependency_overrides[segment.get_inference_runtime] = lambda: _runtime
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user] = _override_user
     return TestClient(app)
@@ -91,7 +95,7 @@ def test_segment_endpoint_returns_data_url():
          patch.object(segment.crud_ml_models, "get_ml_model_by_id", new=AsyncMock(return_value=_model())), \
          patch.object(segment, "_is_readable_file", return_value=True), \
          patch.object(segment, "read_tif_rgb_window", return_value=_read_result()), \
-         patch.object(segment.deeplab_service, "segment_rgba_png", return_value=result_png):
+         patch.object(_runtime, "segment_rgba_png", return_value=result_png):
         response = client.post(
             "/api/segment",
             json={
@@ -126,7 +130,7 @@ def test_segment_endpoint_passes_classes_to_service():
          patch.object(segment.crud_ml_models, "get_ml_model_by_id", new=AsyncMock(return_value=_model())), \
          patch.object(segment, "_is_readable_file", return_value=True), \
          patch.object(segment, "read_tif_rgb_window", return_value=_read_result()), \
-         patch.object(segment.deeplab_service, "segment_rgba_png", return_value=result_png) as segment_rgba:
+         patch.object(_runtime, "segment_rgba_png", return_value=result_png) as segment_rgba:
         response = client.post(
             "/api/segment",
             json={
@@ -168,7 +172,7 @@ def test_segment_endpoint_aligns_partial_overlap_to_full_bbox_canvas():
          patch.object(segment.crud_ml_models, "get_ml_model_by_id", new=AsyncMock(return_value=_model())), \
          patch.object(segment, "_is_readable_file", return_value=True), \
          patch.object(segment, "read_tif_rgb_window", return_value=read_result), \
-         patch.object(segment.deeplab_service, "segment_rgba_png", return_value=result_png):
+         patch.object(_runtime, "segment_rgba_png", return_value=result_png):
         response = client.post(
             "/api/segment",
             json={
@@ -217,7 +221,7 @@ def test_segment_endpoint_handles_large_intermediate_png():
          patch.object(segment.crud_ml_models, "get_ml_model_by_id", new=AsyncMock(return_value=_model())), \
          patch.object(segment, "_is_readable_file", return_value=True), \
          patch.object(segment, "read_tif_rgb_window", return_value=read_result), \
-         patch.object(segment.deeplab_service, "segment_rgba_png", return_value=big_png):
+         patch.object(_runtime, "segment_rgba_png", return_value=big_png):
         response = client.post(
             "/api/segment",
             json={
@@ -406,7 +410,7 @@ def test_segment_endpoint_scopes_image_and_model_to_current_user():
          patch.object(segment.crud_ml_models, "get_ml_model_by_id", new=model_lookup), \
          patch.object(segment, "_is_readable_file", return_value=True), \
          patch.object(segment, "read_tif_rgb_window", return_value=_read_result()), \
-         patch.object(segment.deeplab_service, "segment_rgba_png", return_value=_png_bytes("RGBA", (4, 3))):
+         patch.object(_runtime, "segment_rgba_png", return_value=_png_bytes("RGBA", (4, 3))):
         response = client.post(
             "/api/segment",
             json={
@@ -486,9 +490,9 @@ def test_segment_endpoint_maps_incompatible_weight_to_422():
          patch.object(segment, "_is_readable_file", return_value=True), \
          patch.object(segment, "read_tif_rgb_window", return_value=_read_result()), \
          patch.object(
-             segment.deeplab_service,
+             _runtime,
              "segment_rgba_png",
-             side_effect=segment.deeplab_service.ModelLoadError("bad state dict"),
+             side_effect=segment.ModelLoadError("bad state dict"),
          ):
         response = client.post(
             "/api/segment",
@@ -521,7 +525,7 @@ def test_segment_endpoint_reads_only_database_img_path():
          patch.object(segment.crud_ml_models, "get_ml_model_by_id", new=AsyncMock(return_value=_model())), \
          patch.object(segment, "_is_readable_file", return_value=True), \
          patch.object(segment, "read_tif_rgb_window", read), \
-         patch.object(segment.deeplab_service, "segment_rgba_png", return_value=_png_bytes("RGBA", (4, 3))):
+         patch.object(_runtime, "segment_rgba_png", return_value=_png_bytes("RGBA", (4, 3))):
         response = client.post(
             "/api/segment",
             json={
