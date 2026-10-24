@@ -1,52 +1,58 @@
 from datetime import datetime
-from typing import Optional
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
-class MLModelResponse(BaseModel):
-    """模型上传响应"""
+ModelType = Literal["land-cover", "change-detection"]
+VersionStatus = Literal["UPLOADING", "BUILDING", "VALIDATING", "AVAILABLE", "BUILD_FAILED", "VALIDATION_FAILED", "OFFLINE"]
+Tag = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
+
+
+class ModelResourceSummary(BaseModel):
+    # A version being uploaded may not have resource metadata yet. Only these
+    # public fields can leave the API; other manifest keys stay private.
+    cpu_cores: float | None = Field(default=None, gt=0)
+    memory_mb: int | None = Field(default=None, gt=0)
+    gpu_count: int | None = Field(default=None, ge=0)
+
+
+class ModelVersionSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    user_id: int
-    model_name: str
-    model_type: str
+    version: str
+    status: VersionStatus
     framework: str
-    weight_file_path: str
-    model_file_path: str
-    description: Optional[str]
-    upload_time: Optional[datetime]
-    updated_time: Optional[datetime]
+    input_description: str
+    input_bands: list[int]
+    resource_requirements: ModelResourceSummary
 
 
 class MLModelListItem(BaseModel):
-    """模型列表单条记录响应"""
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
     model_name: str
-    model_type: str
-    framework: str
-    weight: str
-    model_file: str
-    description: Optional[str]
-    update_date: Optional[str]
+    model_type: ModelType
+    description: str | None
+    tags: list[str]
+    production_version_id: int | None
+    version: ModelVersionSummary | None
+    business_capabilities: list[Literal["land-cover"]]
+    updated_at: datetime
 
 
 class MLModelListResponse(BaseModel):
-    """模型列表分页响应"""
-
     items: list[MLModelListItem]
     total: int
     page: int
     pageSize: int
+    can_manage: bool
 
 
 class MLModelUpdateRequest(BaseModel):
-    """模型编辑请求"""
+    """Only catalog metadata can be edited; asset and version fields are rejected."""
+    model_config = ConfigDict(extra="forbid")
 
-    model_name: Optional[str] = None
-    model_type: Optional[str] = None
-    framework: Optional[str] = None
-    description: Optional[str] = None
+    model_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=40)]
+    description: str | None = Field(max_length=200)
+    tags: list[Tag] = Field(max_length=20)

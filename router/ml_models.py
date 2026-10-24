@@ -1,389 +1,67 @@
-import asyncio
-import logging
-from pathlib import Path
-from typing import Optional
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-logger = logging.getLogger(__name__)
-
 from config.db_config import get_db
-from crud.ml_models import (
-    create_ml_model,
-    delete_ml_model,
-    get_ml_model_by_id,
-    get_ml_models,
-    update_ml_model,
-)
-from schemas.ml_models import (
-    MLModelListItem,
-    MLModelListResponse,
-    MLModelResponse,
-)
-from utils.model_asset_storage import ModelAssetTooLargeError, save_upload_file
-from utils.content_hash import resolve_content_sha256
+from crud.system_models import list_system_models
+from models.system_models import SystemModel
+from models.users import User
+from schemas.ml_models import MLModelListItem, MLModelListResponse, MLModelUpdateRequest, ModelType, ModelVersionSummary
 from utils.get_user_by_token import get_current_user
+from utils.model_permissions import require_model_admin
 from utils.response import error_response, success_response
 
 
 router = APIRouter(prefix="/api/models", tags=["models"])
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-WEIGHT_EXTENSIONS = {".pth", ".pt", ".h5", ".onnx", ".pdparams"}
-MODEL_FILE_EXTENSIONS = {".py", ".zip"}
-MAX_WEIGHT_SIZE = 1 * 1024 * 1024 * 1024
-MAX_MODEL_FILE_SIZE = 100 * 1024 * 1024
-MODEL_TYPES = {"semantic_segmentation", "change_detection", "target_extraction"}
-FRAMEWORKS = {"PyTorch", "TensorFlow", "PaddlePaddle", "ONNX"}
+Database = Annotated[AsyncSession, Depends(get_db)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-def _get_suffix(upload_file: UploadFile) -> str:
-    if upload_file.filename is None:
-        return ""
-    return Path(upload_file.filename).suffix.lower()
-
-
-def _validate_metadata(
-    model_name: Optional[str],
-    model_type: Optional[str],
-    framework: Optional[str],
-    description: Optional[str],
-    require_all: bool,
-) -> Optional[str]:
-    if model_name is not None:
-        if not 2 <= len(model_name) <= 40:
-            return "模型名称长度必须为 2-40 个字符"
-    elif require_all:
-        return "模型名称不能为空"
-
-    if model_type is not None:
-        if model_type not in MODEL_TYPES:
-            return "模型类型不合法"
-    elif require_all:
-        return "模型类型不能为空"
-
-    if framework is not None:
-        if framework not in FRAMEWORKS:
-            return "框架不合法"
-    elif require_all:
-        return "框架不能为空"
-
-    if description is not None:
-        minimum = 5 if require_all else 0
-        if not minimum <= len(description) <= 200:
-            return "模型描述长度不合法"
-    elif require_all:
-        return "模型描述不能为空"
-
-    return None
-
-
-def _validate_file(
-    upload_file: UploadFile,
-    extensions: set[str],
-    max_size: int,
-    invalid_message: str,
-    size_message: str,
-) -> Optional[str]:
-    if _get_suffix(upload_file) not in extensions:
-        return invalid_message
-    if upload_file.size is not None and upload_file.size > max_size:
-        return size_message
-    return None
-
-
-def _safe_unlink(file_path: Optional[Path]) -> None:
-    if file_path is None:
-        return
-    try:
-        file_path.unlink(missing_ok=True)
-        file_path.parent.rmdir()
-    except Exception:
-        pass
-
-
-@router.post("/upload", summary="上传模型")
-async def upload_model(
-    model_name: str = Form(...),
-    model_type: str = Form(...),
-    framework: str = Form(...),
-    weight: UploadFile = File(...),
-    model_file: UploadFile = File(...),
-    description: str = Form(...),
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    validation_error = _validate_metadata(
-        model_name,
-        model_type,
-        framework,
-        description,
-        require_all=True,
-    )
-    if validation_error is not None:
-        return error_response(400, validation_error)
-
-    validation_error = _validate_file(
-        weight,
-        WEIGHT_EXTENSIONS,
-        MAX_WEIGHT_SIZE,
-        "不支持的权重文件类型",
-        "权重文件超过大小限制（最大 1 GB）",
-    )
-    if validation_error is not None:
-        return error_response(400, validation_error)
-
-    validation_error = _validate_file(
-        model_file,
-        MODEL_FILE_EXTENSIONS,
-        MAX_MODEL_FILE_SIZE,
-        "不支持的模型文件类型",
-        "模型文件超过大小限制（最大 100 MB）",
-    )
-    if validation_error is not None:
-        return error_response(400, validation_error)
-
-    weight_path: Optional[Path] = None
-    model_file_path: Optional[Path] = None
-
-    try:
-        weight_path = await save_upload_file(
-            weight,
-            BASE_DIR / "uploads" / "model_assets",
-            current_user.id,
-            MAX_WEIGHT_SIZE,
-        )
-        model_file_path = await save_upload_file(
-            model_file,
-            BASE_DIR / "uploads" / "model_assets",
-            current_user.id,
-            MAX_MODEL_FILE_SIZE,
-        )
-        weight_hash = await asyncio.to_thread(resolve_content_sha256, weight_path)
-
-        db_record = await create_ml_model(
-            db=db,
-            user_id=current_user.id,
-            model_name=model_name,
-            model_type=model_type,
-            framework=framework,
-            weight_file_path=str(weight_path),
-            model_file_path=str(model_file_path),
-            description=description,
-            weight_content_sha256=weight_hash.sha256,
-            weight_content_sha256_size=weight_hash.size,
-            weight_content_sha256_mtime_ns=weight_hash.mtime_ns,
-        )
-        data = MLModelResponse.model_validate(db_record).model_dump(mode="json")
-        await db.commit()
-        return success_response(message="上传成功", data=data)
-    except ModelAssetTooLargeError as e:
-        logger.exception("上传模型文件超过大小限制: %s", e)
-        await db.rollback()
-        _safe_unlink(weight_path)
-        _safe_unlink(model_file_path)
-        if e.max_size == MAX_WEIGHT_SIZE:
-            return error_response(400, "权重文件超过大小限制（最大 1 GB）")
-        return error_response(400, "模型文件超过大小限制（最大 100 MB）")
-    except Exception as e:
-        logger.exception("上传模型失败: %s", e)
-        await db.rollback()
-        _safe_unlink(weight_path)
-        _safe_unlink(model_file_path)
-        return error_response(500, "上传失败")
-
-
-@router.get("/list", summary="获取模型列表")
+@router.get("/list", summary="系统模型目录")
 async def list_models(
-    page: int = Query(default=1, ge=1),
-    pageSize: int = Query(default=10, ge=1, le=100),
-    keyword: str = Query(default=""),
-    modelType: Optional[str] = Query(default=None),
-    framework: Optional[str] = Query(default=None),
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: Database,
+    current_user: CurrentUser,
+    page: Annotated[int, Query(ge=1)] = 1,
+    pageSize: Annotated[int, Query(ge=1, le=100)] = 10,
+    keyword: Annotated[str, Query(max_length=255)] = "",
+    modelType: ModelType | None = None,
 ):
-    try:
-        items, total = await get_ml_models(
-            db,
-            current_user.id,
-            page,
-            pageSize,
-            keyword,
-            modelType,
-            framework,
-        )
-        response = MLModelListResponse(
-            items=[
-                MLModelListItem(
-                    id=item.id,
-                    model_name=item.model_name,
-                    model_type=item.model_type,
-                    framework=item.framework,
-                    weight=Path(item.weight_file_path).name,
-                    model_file=Path(item.model_file_path).name,
-                    description=item.description,
-                    update_date=item.updated_time.strftime("%Y-%m-%d") if item.updated_time else None,
-                )
-                for item in items
-            ],
-            total=total,
-            page=page,
-            pageSize=pageSize,
-        )
-        return success_response(data=response.model_dump())
-    except Exception as e:
-        logger.exception("获取模型列表失败: %s", e)
-        return error_response(500, "获取模型列表失败")
-
-
-@router.put("/{model_id}", summary="更新模型")
-async def update_model(
-    model_id: int,
-    request: Request,
-    model_name: Optional[str] = Form(None),
-    model_type: Optional[str] = Form(None),
-    framework: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
-    weight: Optional[UploadFile] = File(None),
-    model_file: Optional[UploadFile] = File(None),
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    record = await get_ml_model_by_id(db, model_id, current_user.id)
-    if record is None:
-        return error_response(404, "模型不存在")
-
-    form = await request.form()
-    if model_name is None and "model_name" in form:
-        model_name = ""
-    if model_type is None and "model_type" in form:
-        model_type = ""
-    if framework is None and "framework" in form:
-        framework = ""
-    if description is None and "description" in form:
-        description = ""
-
-    validation_error = _validate_metadata(
-        model_name,
-        model_type,
-        framework,
-        description,
-        require_all=False,
+    rows, total = await list_system_models(
+        db, page=page, page_size=pageSize, keyword=keyword.strip(), model_type=modelType,
     )
-    if validation_error is not None:
-        return error_response(400, validation_error)
-
-    if weight is not None:
-        validation_error = _validate_file(
-            weight,
-            WEIGHT_EXTENSIONS,
-            MAX_WEIGHT_SIZE,
-            "不支持的权重文件类型",
-            "权重文件超过大小限制（最大 1 GB）",
-        )
-        if validation_error is not None:
-            return error_response(400, validation_error)
-
-    if model_file is not None:
-        validation_error = _validate_file(
-            model_file,
-            MODEL_FILE_EXTENSIONS,
-            MAX_MODEL_FILE_SIZE,
-            "不支持的模型文件类型",
-            "模型文件超过大小限制（最大 100 MB）",
-        )
-        if validation_error is not None:
-            return error_response(400, validation_error)
-
-    old_w_path = Path(record.weight_file_path) if weight is not None else None
-    old_m_path = Path(record.model_file_path) if model_file is not None else None
-
-    update_kwargs = {}
-    if model_name is not None:
-        update_kwargs["model_name"] = model_name
-    if model_type is not None:
-        update_kwargs["model_type"] = model_type
-    if framework is not None:
-        update_kwargs["framework"] = framework
-    if description is not None:
-        update_kwargs["description"] = description
-
-    new_w_path: Optional[Path] = None
-    new_m_path: Optional[Path] = None
-
-    try:
-        if weight is not None:
-            new_w_path = await save_upload_file(
-                weight,
-                BASE_DIR / "uploads" / "model_assets",
-                current_user.id,
-                MAX_WEIGHT_SIZE,
-            )
-            update_kwargs["weight_file_path"] = str(new_w_path)
-            weight_hash = await asyncio.to_thread(resolve_content_sha256, new_w_path)
-            update_kwargs["weight_content_sha256"] = weight_hash.sha256
-            update_kwargs["weight_content_sha256_size"] = weight_hash.size
-            update_kwargs["weight_content_sha256_mtime_ns"] = weight_hash.mtime_ns
-
-        if model_file is not None:
-            new_m_path = await save_upload_file(
-                model_file,
-                BASE_DIR / "uploads" / "model_assets",
-                current_user.id,
-                MAX_MODEL_FILE_SIZE,
-            )
-            update_kwargs["model_file_path"] = str(new_m_path)
-
-        if not update_kwargs:
-            return success_response(message="无改动")
-
-        await update_ml_model(db, model_id, current_user.id, **update_kwargs)
-
-        await db.commit()
-
-        _safe_unlink(old_w_path)
-        _safe_unlink(old_m_path)
-
-        return success_response(message="更新成功")
-    except ModelAssetTooLargeError as e:
-        logger.exception("更新模型文件超过大小限制: %s", e)
-        await db.rollback()
-        _safe_unlink(new_w_path)
-        _safe_unlink(new_m_path)
-        if e.max_size == MAX_WEIGHT_SIZE:
-            return error_response(400, "权重文件超过大小限制（最大 1 GB）")
-        return error_response(400, "模型文件超过大小限制（最大 100 MB）")
-    except Exception as e:
-        logger.exception("更新模型失败: %s", e)
-        await db.rollback()
-        _safe_unlink(new_w_path)
-        _safe_unlink(new_m_path)
-        return error_response(500, "更新失败")
+    data = MLModelListResponse(
+        items=[MLModelListItem(
+            id=model.id, model_name=model.model_name, model_type=model.model_type,
+            description=model.description, tags=model.tags,
+            production_version_id=model.production_version_id,
+            version=ModelVersionSummary.model_validate(version) if version is not None else None,
+            # Runtime/selector integration belongs to later tickets. Technical
+            # availability alone must not enable a business action.
+            business_capabilities=[], updated_at=model.updated_at,
+        ) for model, version in rows],
+        total=total, page=page, pageSize=pageSize, can_manage=current_user.is_admin,
+    )
+    return success_response(data=data.model_dump(mode="json"))
 
 
-@router.delete("/{model_id}", summary="删除模型")
-async def delete_model(
-    model_id: int,
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        paths = await delete_ml_model(db, model_id, current_user.id)
-        if paths is None:
-            return error_response(404, "模型不存在")
+@router.put("/{model_id}", summary="编辑模型目录信息", dependencies=[Depends(require_model_admin)])
+async def update_model(model_id: int, payload: MLModelUpdateRequest, db: Database):
+    model = await db.get(SystemModel, model_id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    model.model_name = payload.model_name
+    model.description = payload.description
+    model.tags = payload.tags
+    await db.commit()
+    return success_response(message="目录信息已更新")
 
-        w_path, m_path = paths
-        await db.commit()
 
-        if w_path:
-            _safe_unlink(Path(w_path))
-        if m_path:
-            _safe_unlink(Path(m_path))
+@router.post("/upload", summary="模型包上传（尚未开放）", dependencies=[Depends(require_model_admin)])
+async def upload_model():
+    return error_response(503, "模型包上传将在后续版本开放")
 
-        return success_response(message="删除成功")
-    except Exception as e:
-        logger.exception("删除模型失败: %s", e)
-        await db.rollback()
-        return error_response(500, "删除失败")
+
+@router.delete("/{model_id}", summary="不支持物理删除模型", dependencies=[Depends(require_model_admin)])
+async def delete_model(model_id: int):
+    return error_response(405, "不支持物理删除模型，请使用后续开放的版本下线功能")

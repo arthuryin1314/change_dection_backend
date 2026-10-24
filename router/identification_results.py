@@ -299,6 +299,7 @@ def _serialize_result(row) -> dict:
         "status": row.status,
         "source_image_id": row.source_image_id,
         "source_model_id": row.source_model_id,
+        "model_available": row.source_model_id is not None,
         "source": row.source_snapshot,
         "identity_sha256": row.identity_sha256,
         "image_content_sha256": row.image_content_sha256,
@@ -350,6 +351,7 @@ def _history_render_status(row) -> str:
 def _serialize_history_item(row) -> dict:
     return {
         "result_id": row.id,
+        "model_available": row.source_model_id is not None,
         "source": row.source_snapshot,
         "completed_at": _iso(row.completed_at),
         "area_status": row.area_status,

@@ -368,6 +368,7 @@ def test_history_lists_saved_results_and_reads_detail_without_writing(tmp_path):
     assert listing.json()["data"] == {
         "items": [{
             "result_id": "result-1",
+            "model_available": True,
             "source": row.source_snapshot,
             "completed_at": "2026-09-06T00:00:00+00:00",
             "area_status": "SUCCEEDED",
@@ -381,6 +382,29 @@ def test_history_lists_saved_results_and_reads_detail_without_writing(tmp_path):
     assert detail.json()["data"]["render_status"] == "AVAILABLE"
     assert db.committed is False
     assert db.flushed is False
+
+
+def test_history_with_removed_model_keeps_saved_result_and_cannot_rerun(tmp_path):
+    from utils.exception_handler import register_exception_handlers
+
+    client, db = _make_client()
+    del client.app.dependency_overrides[identification_results.get_inference_runtime]
+    register_exception_handlers(client.app)
+    row = _stored_result(tmp_path)
+    row.source_model_id = None
+    with patch.object(identification_results.crud_results, "list_succeeded_history", new=AsyncMock(return_value=([row], 1))), patch.object(
+        identification_results.crud_results, "get_succeeded_history_by_id", new=AsyncMock(return_value=row),
+    ):
+        listing = client.get("/api/identification-results/history").json()["data"]
+        detail = client.get("/api/identification-results/history/result-1").json()["data"]
+        retry = client.post("/api/identification-results", json={"image_id": 1, "model_id": 11})
+    assert listing["items"][0]["model_available"] is False
+    assert detail["model_available"] is False
+    assert detail["source"] == row.source_snapshot
+    assert detail["class_area_m2"] == [1, 2, 3, 4, 5, 6]
+    assert detail["render_status"] == "AVAILABLE"
+    assert retry.status_code == 503
+    assert db.committed is False
 
 
 def test_history_detail_reports_missing_saved_files_without_invalidating_result(tmp_path):
