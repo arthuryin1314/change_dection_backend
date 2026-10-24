@@ -424,6 +424,7 @@ def _serialize_history_item(row) -> dict:
         "completed_at": _iso(row.completed_at),
         "calculated_at": _iso(row.calculated_at),
         "result_status": _history_result_status(row),
+        "model_available": row.source_model_id is not None,
         "before": _normalize_snapshot(row.before_snapshot),
         "after": _normalize_snapshot(row.after_snapshot),
     }
@@ -487,7 +488,9 @@ async def get_change_history(
             "变化历史结果数据不完整",
             {"result_id": result_id, "status": "INCOMPLETE"},
         )
-    return api_response(200, "查询成功", _serialize(row, row.request_id))
+    data = _serialize(row, row.request_id)
+    data["model_available"] = row.source_model_id is not None
+    return api_response(200, "查询成功", data)
 
 
 @router.get("/history/{result_id}/artifacts/{artifact_name}")

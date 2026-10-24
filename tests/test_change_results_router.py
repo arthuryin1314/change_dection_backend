@@ -604,6 +604,7 @@ def test_history_lists_complete_and_legacy_results_without_writing():
     legacy = _succeeded()
     legacy.id = 40
     legacy.calculated_at = None
+    legacy.source_model_id = None
 
     with patch.object(
         change_results.crud_results,
@@ -622,6 +623,7 @@ def test_history_lists_complete_and_legacy_results_without_writing():
                 "completed_at": "2026-09-10T00:00:00+00:00",
                 "calculated_at": "2026-09-10T00:00:00+00:00",
                 "result_status": "AVAILABLE",
+                "model_available": True,
                 "before": complete.before_snapshot,
                 "after": complete.after_snapshot,
             },
@@ -631,6 +633,7 @@ def test_history_lists_complete_and_legacy_results_without_writing():
                 "completed_at": "2026-09-10T00:00:00+00:00",
                 "calculated_at": None,
                 "result_status": "INCOMPLETE",
+                "model_available": False,
                 "before": legacy.before_snapshot,
                 "after": legacy.after_snapshot,
             },
@@ -660,10 +663,12 @@ def test_history_detail_rejects_incomplete_legacy_result_before_serializing():
     assert db.commits == 0
 
 
-def test_history_detail_returns_optional_grid_without_expiring_task():
+@pytest.mark.parametrize("model_id", [11, None])
+def test_history_detail_returns_optional_grid_without_expiring_task(model_id):
     client, db = _client()
     del client.app.dependency_overrides[change_results.require_change_creation]
     row = _succeeded()
+    row.source_model_id = model_id
 
     with patch.object(
         change_results.crud_results,
@@ -679,6 +684,10 @@ def test_history_detail_returns_optional_grid_without_expiring_task():
 
     assert response.status_code == 200
     assert response.json()["data"]["result_id"] == 41
+    assert response.json()["data"]["model_available"] is (model_id is not None)
+    assert response.json()["data"]["matrix_m2"] == row.matrix_m2
+    assert response.json()["data"]["before"] == row.before_snapshot
+    assert response.json()["data"]["after"] == row.after_snapshot
     assert response.json()["data"]["grid"]["crs"] == "EPSG:4528"
     assert response.json()["data"]["analysis"]["resolution"] is None
     assert db.commits == 0
